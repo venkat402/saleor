@@ -46,7 +46,10 @@ class ProductExportFields:
             "cost_price_amount": "cost price",
             "variant_currency": "variant_currency",
         },
-        "common": {"images": "images"},
+        "images": {
+            "product_images": "product_images",
+            "variant_images": "variant_images",
+        },
     }
 
 
@@ -87,9 +90,7 @@ def prepare_products_data(
         relations_data = product_relations_data.get(pk, {})
         data = {**product_data, **relations_data}
 
-        products_with_variants_data.append(data)
-
-        variants_data, *headers = prepare_variants_data(pk)
+        variants_data, *headers = prepare_variants_data(pk, data)
         products_with_variants_data.extend(variants_data)
         variants_attributes_fields.update(headers[0])
         warehouse_fields.update(headers[1])
@@ -136,7 +137,7 @@ def prepare_product_relations_data(
         if attribute_header:
             attributes_headers.add(attribute_header)
 
-        result_data = add_image_uris_to_data(pk, image, result_data)
+        result_data = add_image_uris_to_data(pk, image, "product_images", result_data)
         result_data = add_collection_info_to_data(pk, collection, result_data)
 
     result: Dict[int, Dict[str, str]] = {
@@ -166,7 +167,7 @@ def add_collection_info_to_data(
     return result_data
 
 
-def prepare_variants_data(pk: int) -> Tuple[List[dict], set, set]:
+def prepare_variants_data(pk: int, product_data: dict) -> Tuple[List[dict], set, set]:
     """Prepare variants data for product with given pk.
 
     This function gets product pk and prepared data about product's variants.
@@ -194,7 +195,7 @@ def prepare_variants_data(pk: int) -> Tuple[List[dict], set, set]:
     )
 
     result_data, variant_attributes_headers, warehouse_headers = update_variant_data(
-        variants_data
+        variants_data, product_data
     )
 
     result = [
@@ -208,7 +209,7 @@ def prepare_variants_data(pk: int) -> Tuple[List[dict], set, set]:
 
 
 def update_variant_data(
-    variants_data: List[Dict[str, Union[str, int]]]
+    variants_data: List[Dict[str, Union[str, int]]], product_data: dict
 ) -> Tuple[Dict[int, dict], set, set]:
     """Update variant data with info about relations fields.
 
@@ -233,6 +234,8 @@ def update_variant_data(
         image: str = data.pop("image_path")  # type: ignore
 
         if pk not in result_data:
+            # add product data to variant row
+            data.update(product_data)
             result_data[pk] = data
 
         result_data, attribute_header = add_attribute_info_to_data(
@@ -247,13 +250,13 @@ def update_variant_data(
         if headers:
             warehouse_headers.update(headers)
 
-        result_data = add_image_uris_to_data(pk, image, result_data)
+        result_data = add_image_uris_to_data(pk, image, "variant_images", result_data)
 
     return result_data, variant_attributes_headers, warehouse_headers
 
 
 def add_image_uris_to_data(
-    pk: int, image: str, result_data: Dict[int, dict]
+    pk: int, image: str, header: str, result_data: Dict[int, dict]
 ) -> Dict[int, dict]:
     """Add absolute uri of given image path to product or variant data.
 
@@ -262,7 +265,6 @@ def add_image_uris_to_data(
     absolute uri of given image is added to set with other uris.
     """
     if image:
-        header = "images"
         uri = build_absolute_uri(os.path.join(settings.MEDIA_URL, image))
         if header in result_data[pk]:
             result_data[pk][header].add(uri)
