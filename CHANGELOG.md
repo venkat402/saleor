@@ -99,6 +99,7 @@ All notable, unreleased changes to this project will be documented in this file.
 - Add tests for pagination - #5468 by @koradon
 - Add job abstract model and interface - #5510 by @IKarbowiak
 - Refactor implementation of allocation - #5445 by @fowczarek
+- Add "it works" page - #5517 by @dominik-zeglen
 
 ## 2.9.0
 
