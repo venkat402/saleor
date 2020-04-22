@@ -3964,10 +3964,7 @@ def test_create_stocks(variant, warehouse):
 
 def test_update_or_create_variant_stocks(variant, warehouses):
     Stock.objects.create(
-        product_variant=variant,
-        warehouse=warehouses[0],
-        quantity=5,
-        quantity_allocated=3,
+        product_variant=variant, warehouse=warehouses[0], quantity=5,
     )
     stocks_data = [
         {"quantity": 10, "warehouse": "123"},
@@ -3990,10 +3987,7 @@ def test_update_or_create_variant_stocks(variant, warehouses):
 
 def test_update_or_create_variant_stocks_empty_stocks_data(variant, warehouses):
     Stock.objects.create(
-        product_variant=variant,
-        warehouse=warehouses[0],
-        quantity=5,
-        quantity_allocated=3,
+        product_variant=variant, warehouse=warehouses[0], quantity=5,
     )
 
     ProductVariantStocksUpdate.update_or_create_variant_stocks(variant, [], warehouses)
