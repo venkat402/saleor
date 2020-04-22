@@ -136,6 +136,7 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     email = models.EmailField(unique=True)
     first_name = models.CharField(max_length=256, blank=True)
     last_name = models.CharField(max_length=256, blank=True)
+    phone = models.CharField(max_length=25, blank=True)
     addresses = models.ManyToManyField(
         Address, blank=True, related_name="user_addresses"
     )

@@ -55,7 +55,7 @@ CACHES = {"default": django_cache_url.config()}
 
 DATABASES = {
     "default": dj_database_url.config(
-        default="postgres://saleor:saleor@localhost:5432/saleor", conn_max_age=600
+        default="postgres://postgres:welcome@localhost:5432/saleor_two", conn_max_age=600
     )
 }
 
@@ -200,7 +200,7 @@ TEMPLATES = [
 ]
 
 # Make this unique, and don't share it with anybody.
-SECRET_KEY = os.environ.get("SECRET_KEY")
+SECRET_KEY = os.environ.get("SECRET_KEY","alsdkjflsdflaskdjflsdjflksjdfl")
 
 MIDDLEWARE = [
     "django.contrib.sessions.middleware.SessionMiddleware",
