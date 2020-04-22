@@ -17,15 +17,17 @@ from saleor.order.actions import (
 from saleor.order.models import Fulfillment
 from saleor.payment import ChargeStatus, PaymentError
 from saleor.product.models import DigitalContent
+from saleor.warehouse.models import Allocation, Stock
 
 from .utils import create_image
 
 
 @pytest.fixture
-def order_with_digital_line(order, digital_content, variant, site_settings):
+def order_with_digital_line(order, digital_content, stock, site_settings):
     site_settings.automatic_fulfillment_digital_products = True
     site_settings.save()
 
+    variant = stock.product_variant
     variant.digital_content = digital_content
     variant.digital_content.save()
 
@@ -34,18 +36,22 @@ def order_with_digital_line(order, digital_content, variant, site_settings):
     product_type.is_digital = True
     product_type.save()
 
+    quantity = 3
     net = variant.get_price()
     gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.lines.create(
+    line = order.lines.create(
         product_name=str(variant.product),
         variant_name=str(variant),
         product_sku=variant.sku,
         is_shipping_required=variant.is_shipping_required(),
-        quantity=3,
+        quantity=quantity,
         variant=variant,
         unit_price=TaxedMoney(net=net, gross=gross),
         tax_rate=23,
     )
+
+    Allocation.objects.create(order_line=line, stock=stock, quantity_allocated=quantity)
+
     return order
 
 
@@ -62,9 +68,12 @@ def test_handle_fully_paid_order_digital_lines(
 
     fulfillment = order.fulfillments.first()
 
-    event_order_paid, event_email_sent, event_order_fulfilled, event_digital_links = (
-        order.events.all()
-    )
+    (
+        event_order_paid,
+        event_email_sent,
+        event_order_fulfilled,
+        event_digital_links,
+    ) = order.events.all()
     assert event_order_paid.type == OrderEvents.ORDER_FULLY_PAID
 
     assert event_email_sent.type == OrderEvents.EMAIL_SENT
@@ -119,6 +128,14 @@ def test_mark_as_paid(admin_user, draft_order):
     assert draft_order.events.last().type == (OrderEvents.ORDER_MARKED_AS_PAID)
 
 
+def test_mark_as_paid_no_billing_address(admin_user, draft_order):
+    draft_order.billing_address = None
+    draft_order.save()
+
+    with pytest.raises(Exception):
+        mark_order_as_paid(draft_order, admin_user)
+
+
 def test_clean_mark_order_as_paid(payment_txn_preauth):
     order = payment_txn_preauth.order
     with pytest.raises(PaymentError):
@@ -154,12 +171,13 @@ def test_fulfill_order_line(order_with_lines):
     line = order.lines.first()
     quantity_fulfilled_before = line.quantity_fulfilled
     variant = line.variant
-    stock_quantity_after = variant.quantity - line.quantity
+    stock = Stock.objects.get(product_variant=variant)
+    stock_quantity_after = stock.quantity - line.quantity
 
     fulfill_order_line(line, line.quantity)
 
-    variant.refresh_from_db()
-    assert variant.quantity == stock_quantity_after
+    stock.refresh_from_db()
+    assert stock.quantity == stock_quantity_after
     assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
 
 
@@ -179,14 +197,15 @@ def test_fulfill_order_line_without_inventory_tracking(order_with_lines):
     variant = line.variant
     variant.track_inventory = False
     variant.save()
+    stock = Stock.objects.get(product_variant=variant)
 
     # stock should not change
-    stock_quantity_after = variant.quantity
+    stock_quantity_after = stock.quantity
 
     fulfill_order_line(line, line.quantity)
 
-    variant.refresh_from_db()
-    assert variant.quantity == stock_quantity_after
+    stock.refresh_from_db()
+    assert stock.quantity == stock_quantity_after
     assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
 
 

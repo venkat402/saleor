@@ -1,9 +1,6 @@
 from typing import TYPE_CHECKING, List
 
-from django.utils.translation import pgettext_lazy
-
-from saleor.extensions import ConfigurationTypeField
-from saleor.extensions.base_plugin import BasePlugin
+from saleor.plugins.base_plugin import BasePlugin, ConfigurationTypeField
 
 from . import (
     GatewayConfig,
@@ -18,13 +15,14 @@ from . import (
 GATEWAY_NAME = "Stripe"
 
 if TYPE_CHECKING:
+    # flake8: noqa
     from . import GatewayResponse, PaymentData
+    from ...interface import CustomerSource
 
 
 def require_active_plugin(fn):
     def wrapped(self, *args, **kwargs):
         previous = kwargs.get("previous_value", None)
-        self._initialize_plugin_configuration()
         if not self.active:
             return previous
         return fn(self, *args, **kwargs)
@@ -34,84 +32,49 @@ def require_active_plugin(fn):
 
 class StripeGatewayPlugin(BasePlugin):
     PLUGIN_NAME = GATEWAY_NAME
+    DEFAULT_CONFIGURATION = [
+        {"name": "Public API key", "value": None},
+        {"name": "Secret API key", "value": None},
+        {"name": "Store customers card", "value": False},
+        {"name": "Automatic payment capture", "value": True},
+    ]
+
     CONFIG_STRUCTURE = {
         "Public API key": {
-            "type": ConfigurationTypeField.STRING,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Provide Stripe public API key"
-            ),
-            "label": pgettext_lazy("Plugin label", "Public API key"),
+            "type": ConfigurationTypeField.SECRET,
+            "help_text": "Provide Stripe public API key",
+            "label": "Public API key",
         },
         "Secret API key": {
-            "type": ConfigurationTypeField.STRING,
-            "help_text": pgettext_lazy(
-                "Plugin help text", "Provide Stripe secret API key"
-            ),
-            "label": pgettext_lazy("Plugin label", "Secret API key"),
+            "type": ConfigurationTypeField.SECRET,
+            "help_text": "Provide Stripe secret API key",
+            "label": "Secret API key",
         },
         "Store customers card": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines if Saleor should store cards on payments"
-                "in Stripe customer.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Store customers card"),
+            "help_text": "Determines if Saleor should store cards on payments"
+            "in Stripe customer.",
+            "label": "Store customers card",
         },
         "Automatic payment capture": {
             "type": ConfigurationTypeField.BOOLEAN,
-            "help_text": pgettext_lazy(
-                "Plugin help text",
-                "Determines if Saleor should automaticaly capture payments.",
-            ),
-            "label": pgettext_lazy("Plugin label", "Automatic payment capture"),
+            "help_text": "Determines if Saleor should automaticaly capture payments.",
+            "label": "Automatic payment capture",
         },
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.config = None
-
-    def _initialize_plugin_configuration(self):
-        super()._initialize_plugin_configuration()
-
-        if self._cached_config and self._cached_config.configuration:
-            configuration = self._cached_config.configuration
-
-            configuration = {item["name"]: item["value"] for item in configuration}
-            self.config = GatewayConfig(
-                gateway_name=GATEWAY_NAME,
-                auto_capture=configuration["Automatic payment capture"],
-                connection_params={
-                    "public_key": configuration["Public API key"],
-                    "private_key": configuration["Secret API key"],
-                },
-                template_path="",
-                store_customer=configuration["Store customers card"],
-            )
-
-    @classmethod
-    def _hide_secret_configuration_fields(cls, configuration):
-        secret_fields = ["Public API key", "Secret API key"]
-        for field in configuration:
-            # We don't want to share our secret data
-            if field.get("name") in secret_fields and field.get("value"):
-                field["value"] = cls.REDACTED_FORM
-
-    @classmethod
-    def _get_default_configuration(cls):
-        defaults = {
-            "name": cls.PLUGIN_NAME,
-            "description": "",
-            "active": False,
-            "configuration": [
-                {"name": "Public API key", "value": ""},
-                {"name": "Secret API key", "value": ""},
-                {"name": "Store customers card", "value": False},
-                {"name": "Automatic payment capture", "value": True},
-            ],
-        }
-        return defaults
+        configuration = {item["name"]: item["value"] for item in self.configuration}
+        self.config = GatewayConfig(
+            gateway_name=GATEWAY_NAME,
+            auto_capture=configuration["Automatic payment capture"],
+            connection_params={
+                "public_key": configuration["Public API key"],
+                "private_key": configuration["Secret API key"],
+            },
+            store_customer=configuration["Store customers card"],
+        )
 
     def _get_gateway_config(self):
         return self.config

@@ -1,8 +1,9 @@
 import graphene
 
+from ...core.permissions import WebhookPermissions
 from ..core.fields import FilterInputConnectionField
 from ..decorators import permission_required
-from .enums import WebhookEventTypeEnum
+from .enums import WebhookSampleEventTypeEnum
 from .filters import WebhookFilterInput
 from .mutations import WebhookCreate, WebhookDelete, WebhookUpdate
 from .resolvers import (
@@ -11,6 +12,7 @@ from .resolvers import (
     resolve_webhook_events,
     resolve_webhooks,
 )
+from .sorters import WebhookSortingInput
 from .types import Webhook, WebhookEvent
 
 
@@ -25,6 +27,7 @@ class WebhookQueries(graphene.ObjectType):
     webhooks = FilterInputConnectionField(
         Webhook,
         description="List of webhooks.",
+        sort_by=WebhookSortingInput(description="Sort webhooks."),
         filter=WebhookFilterInput(description="Filtering options for webhooks."),
     )
     webhook_events = graphene.List(
@@ -34,7 +37,7 @@ class WebhookQueries(graphene.ObjectType):
     webhook_sample_payload = graphene.Field(
         graphene.JSONString,
         event_type=graphene.Argument(
-            WebhookEventTypeEnum,
+            WebhookSampleEventTypeEnum,
             required=True,
             description="Name of the requested event type.",
         ),
@@ -49,15 +52,15 @@ class WebhookQueries(graphene.ObjectType):
         return resolve_sample_payload(info, data["event_type"])
 
     @staticmethod
-    def resolve_webhooks(_, info, **_kwargs):
-        return resolve_webhooks(info)
+    def resolve_webhooks(_, info, **kwargs):
+        return resolve_webhooks(info, **kwargs)
 
     @staticmethod
     def resolve_webhook(_, info, **data):
         return resolve_webhook(info, data["id"])
 
     @staticmethod
-    @permission_required("webhook.manage_webhooks")
+    @permission_required(WebhookPermissions.MANAGE_WEBHOOKS)
     def resolve_webhook_events(_, *_args, **_data):
         return resolve_webhook_events()
 

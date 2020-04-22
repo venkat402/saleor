@@ -1,14 +1,24 @@
 import graphene
 
+from ...core.permissions import SitePermissions
+from ...discount.models import Sale, Voucher
+from ...menu.models import MenuItem
+from ...page.models import Page
+from ...product.models import (
+    Attribute,
+    AttributeValue,
+    Category,
+    Collection,
+    Product,
+    ProductVariant,
+)
+from ...shipping.models import ShippingMethod
 from ..core.connection import CountableConnection
 from ..core.fields import BaseConnectionField
-from ..discount import types as discount_types
+from ..decorators import permission_required
 from ..discount.resolvers import resolve_sales, resolve_vouchers
-from ..menu import types as menu_types
 from ..menu.resolvers import resolve_menu_items
-from ..page import types as page_types
 from ..page.resolvers import resolve_pages
-from ..product import types as product_types
 from ..product.resolvers import (
     resolve_attributes,
     resolve_categories,
@@ -16,24 +26,24 @@ from ..product.resolvers import (
     resolve_product_variants,
     resolve_products,
 )
-from ..shipping import types as shipping_types
+from ..translations import types as translation_types
 from .resolvers import resolve_attribute_values, resolve_shipping_methods
 
 
 class TranslatableItem(graphene.Union):
     class Meta:
         types = (
-            product_types.Product,
-            product_types.Category,
-            product_types.Collection,
-            product_types.Attribute,
-            product_types.AttributeValue,
-            product_types.ProductVariant,
-            page_types.Page,
-            shipping_types.ShippingMethod,
-            discount_types.Sale,
-            discount_types.Voucher,
-            menu_types.MenuItem,
+            translation_types.ProductTranslatableContent,
+            translation_types.CollectionTranslatableContent,
+            translation_types.CategoryTranslatableContent,
+            translation_types.AttributeTranslatableContent,
+            translation_types.AttributeValueTranslatableContent,
+            translation_types.ProductVariantTranslatableContent,
+            translation_types.PageTranslatableContent,
+            translation_types.ShippingMethodTranslatableContent,
+            translation_types.SaleTranslatableContent,
+            translation_types.VoucherTranslatableContent,
+            translation_types.MenuItemTranslatableContent,
         )
 
 
@@ -44,15 +54,15 @@ class TranslatableItemConnection(CountableConnection):
 
 class TranslatableKinds(graphene.Enum):
     ATTRIBUTE = "Attribute"
-    ATTRIBUTE_VALUE = "Attribute value"
+    ATTRIBUTE_VALUE = "AttributeValue"
     CATEGORY = "Category"
     COLLECTION = "Collection"
-    MENU_ITEM = "Menu item"
+    MENU_ITEM = "MenuItem"
     PAGE = "Page"
     PRODUCT = "Product"
     SALE = "Sale"
-    SHIPPING_METHOD = "Shipping method"
-    VARIANT = "Variant"
+    SHIPPING_METHOD = "ShippingMethod"
+    VARIANT = "ProductVariant"
     VOUCHER = "Voucher"
 
 
@@ -62,6 +72,17 @@ class TranslationQueries(graphene.ObjectType):
         description="Returns a list of all translatable items of a given kind.",
         kind=graphene.Argument(
             TranslatableKinds, required=True, description="Kind of objects to retrieve."
+        ),
+    )
+    translation = graphene.Field(
+        TranslatableItem,
+        id=graphene.Argument(
+            graphene.ID, description="ID of the object to retrieve.", required=True
+        ),
+        kind=graphene.Argument(
+            TranslatableKinds,
+            required=True,
+            description="Kind of the object to retrieve.",
         ),
     )
 
@@ -88,3 +109,23 @@ class TranslationQueries(graphene.ObjectType):
             return resolve_menu_items(info, query=None)
         elif kind == TranslatableKinds.SALE:
             return resolve_sales(info, query=None)
+
+    @permission_required(SitePermissions.MANAGE_TRANSLATIONS)
+    def resolve_translation(self, info, id, kind, **_kwargs):
+        _type, kind_id = graphene.Node.from_global_id(id)
+        if not _type == kind:
+            return None
+        models = {
+            TranslatableKinds.PRODUCT.value: Product,
+            TranslatableKinds.COLLECTION.value: Collection,
+            TranslatableKinds.CATEGORY.value: Category,
+            TranslatableKinds.ATTRIBUTE.value: Attribute,
+            TranslatableKinds.ATTRIBUTE_VALUE.value: AttributeValue,
+            TranslatableKinds.VARIANT.value: ProductVariant,
+            TranslatableKinds.PAGE.value: Page,
+            TranslatableKinds.SHIPPING_METHOD.value: ShippingMethod,
+            TranslatableKinds.SALE.value: Sale,
+            TranslatableKinds.VOUCHER.value: Voucher,
+            TranslatableKinds.MENU_ITEM.value: MenuItem,
+        }
+        return models[kind].objects.filter(pk=kind_id).first()

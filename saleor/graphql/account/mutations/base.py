@@ -6,22 +6,25 @@ from django.db import transaction
 from graphql_jwt.exceptions import PermissionDenied
 
 from ....account import events as account_events, models
-from ....account.emails import send_user_password_reset_email_with_url
+from ....account.emails import (
+    send_set_password_email_with_url,
+    send_user_password_reset_email_with_url,
+)
 from ....account.error_codes import AccountErrorCode
+from ....core.permissions import AccountPermissions
 from ....core.utils.url import validate_storefront_url
-from ....dashboard.emails import send_set_password_email_with_url
+from ....order.utils import match_orders_with_new_user
 from ...account.i18n import I18nMixin
 from ...account.types import Address, AddressInput, User
 from ...core.mutations import (
     BaseMutation,
-    ClearMetaBaseMutation,
     CreateToken,
     ModelDeleteMutation,
     ModelMutation,
-    UpdateMetaBaseMutation,
     validation_error_to_error_type,
 )
 from ...core.types.common import AccountError
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
 
 BILLING_ADDRESS_FIELD = "default_billing_address"
 SHIPPING_ADDRESS_FIELD = "default_shipping_address"
@@ -36,18 +39,12 @@ def can_edit_address(user, address):
     - customers associated to the given address.
     """
     return (
-        user.has_perm("account.manage_users")
+        user.has_perm(AccountPermissions.MANAGE_USERS)
         or user.addresses.filter(pk=address.pk).exists()
     )
 
 
 class SetPassword(CreateToken):
-    user = graphene.Field(User, description="A user instance with new password.")
-    account_errors = graphene.List(
-        graphene.NonNull(AccountError),
-        description="List of errors that occurred executing the mutation.",
-    )
-
     class Arguments:
         token = graphene.String(
             description="A one-time token required to set the password.", required=True
@@ -96,14 +93,6 @@ class SetPassword(CreateToken):
         user.save(update_fields=["password"])
         account_events.customer_password_reset_event(user=user)
 
-    @classmethod
-    def handle_typed_errors(cls, errors: list):
-        account_errors = [
-            AccountError(field=e.field, message=e.message, code=code)
-            for e, code, _params in errors
-        ]
-        return cls(errors=[e[0] for e in errors], account_errors=account_errors)
-
 
 class RequestPasswordReset(BaseMutation):
     class Arguments:
@@ -150,6 +139,51 @@ class RequestPasswordReset(BaseMutation):
         return RequestPasswordReset()
 
 
+class ConfirmAccount(BaseMutation):
+    user = graphene.Field(User, description="An activated user account.")
+
+    class Arguments:
+        token = graphene.String(
+            description="A one-time token required to confirm the account.",
+            required=True,
+        )
+        email = graphene.String(
+            description="E-mail of the user performing account confirmation.",
+            required=True,
+        )
+
+    class Meta:
+        description = (
+            "Confirm user account with token sent by email during registration."
+        )
+        error_type_class = AccountError
+        error_type_field = "account_errors"
+
+    @classmethod
+    def perform_mutation(cls, _root, info, **data):
+        try:
+            user = models.User.objects.get(email=data["email"])
+        except ObjectDoesNotExist:
+            raise ValidationError(
+                {
+                    "email": ValidationError(
+                        "User with this email doesn't exist",
+                        code=AccountErrorCode.NOT_FOUND,
+                    )
+                }
+            )
+
+        if not default_token_generator.check_token(user, data["token"]):
+            raise ValidationError(
+                {"token": ValidationError(INVALID_TOKEN, code=AccountErrorCode.INVALID)}
+            )
+
+        user.is_active = True
+        user.save(update_fields=["is_active"])
+        match_orders_with_new_user(user)
+        return ConfirmAccount(user=user)
+
+
 class PasswordChange(BaseMutation):
     user = graphene.Field(User, description="A user instance with a new password.")
 
@@ -179,7 +213,7 @@ class PasswordChange(BaseMutation):
                 {
                     "old_password": ValidationError(
                         "Old password isn't valid.",
-                        code=AccountErrorCode.INVALID_PASSWORD,
+                        code=AccountErrorCode.INVALID_CREDENTIALS,
                     )
                 }
             )
@@ -222,9 +256,7 @@ class BaseAddressUpdate(ModelMutation):
     def perform_mutation(cls, root, info, **data):
         response = super().perform_mutation(root, info, **data)
         user = response.address.user_addresses.first()
-        address = info.context.extensions.change_user_address(
-            response.address, None, user
-        )
+        address = info.context.plugins.change_user_address(response.address, None, user)
         response.user = user
         response.address = address
         return response
@@ -305,13 +337,6 @@ class CustomerInput(UserInput, UserAddressInput):
 
 
 class UserCreateInput(CustomerInput):
-    send_password_email = graphene.Boolean(
-        description=(
-            "DEPRECATED: Will be removed in Saleor 2.10, if mutation has `redirect_url`"
-            " in input then customer get email with link to set a password. "
-            "Send an email with a link to set a password."
-        )
-    )
     redirect_url = graphene.String(
         description=(
             "URL of a view where users should be redirected to "
@@ -341,27 +366,17 @@ class BaseCustomerCreate(ModelMutation, I18nMixin):
             shipping_address = cls.validate_address(
                 shipping_address_data,
                 instance=getattr(instance, SHIPPING_ADDRESS_FIELD),
+                info=info,
             )
             cleaned_input[SHIPPING_ADDRESS_FIELD] = shipping_address
 
         if billing_address_data:
             billing_address = cls.validate_address(
-                billing_address_data, instance=getattr(instance, BILLING_ADDRESS_FIELD)
+                billing_address_data,
+                instance=getattr(instance, BILLING_ADDRESS_FIELD),
+                info=info,
             )
             cleaned_input[BILLING_ADDRESS_FIELD] = billing_address
-
-        # DEPRECATED: We should remove this condition when dropping
-        # `send_password_email` from mutation input.
-        if cleaned_input.get("send_password_email"):
-            if not cleaned_input.get("redirect_url"):
-                raise ValidationError(
-                    {
-                        "redirect_url": ValidationError(
-                            "Redirect url is required to send a password.",
-                            code=AccountErrorCode.REQUIRED,
-                        )
-                    }
-                )
 
         if cleaned_input.get("redirect_url"):
             try:
@@ -379,14 +394,14 @@ class BaseCustomerCreate(ModelMutation, I18nMixin):
         # FIXME: save address in user.addresses as well
         default_shipping_address = cleaned_input.get(SHIPPING_ADDRESS_FIELD)
         if default_shipping_address:
-            default_shipping_address = info.context.extensions.change_user_address(
+            default_shipping_address = info.context.plugins.change_user_address(
                 default_shipping_address, "shipping", instance
             )
             default_shipping_address.save()
             instance.default_shipping_address = default_shipping_address
         default_billing_address = cleaned_input.get(BILLING_ADDRESS_FIELD)
         if default_billing_address:
-            default_billing_address = info.context.extensions.change_user_address(
+            default_billing_address = info.context.plugins.change_user_address(
                 default_billing_address, "billing", instance
             )
             default_billing_address.save()
@@ -397,7 +412,7 @@ class BaseCustomerCreate(ModelMutation, I18nMixin):
 
         # The instance is a new object in db, create an event
         if is_creation:
-            info.context.extensions.customer_created(customer=instance)
+            info.context.plugins.customer_created(customer=instance)
             account_events.customer_account_created_event(user=instance)
 
         if cleaned_input.get("redirect_url"):
@@ -413,7 +428,7 @@ class UserUpdateMeta(UpdateMetaBaseMutation):
         public = True
         error_type_class = AccountError
         error_type_field = "account_errors"
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
 
 
 class UserClearMeta(ClearMetaBaseMutation):
@@ -423,4 +438,4 @@ class UserClearMeta(ClearMetaBaseMutation):
         public = True
         error_type_class = AccountError
         error_type_field = "account_errors"
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)

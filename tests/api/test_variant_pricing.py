@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 from prices import Money, TaxedMoney
 
-from saleor.extensions.manager import ExtensionsManager
+from saleor.plugins.manager import PluginsManager
 from saleor.product.models import ProductVariant
 from saleor.product.utils.availability import get_variant_availability
 from tests.api.utils import get_graphql_content
@@ -13,8 +13,8 @@ query {
     edges {
       node {
         variants {
+          isAvailable
           pricing {
-            available
             onSale
 
             discount {
@@ -59,7 +59,6 @@ def test_get_variant_pricing_on_sale(api_client, sale, product):
     assert pricing
 
     # check availability
-    assert pricing["available"] is True
     assert pricing["onSale"] is True
 
     # check the discount
@@ -85,7 +84,6 @@ def test_get_variant_pricing_not_on_sale(api_client, product):
     assert pricing
 
     # check availability
-    assert pricing["available"] is True
     assert pricing["onSale"] is False
 
     # check the discount
@@ -100,10 +98,10 @@ def test_get_variant_pricing_not_on_sale(api_client, product):
     assert pricing["price"]["net"]["amount"] == product.price.amount
 
 
-def test_variant_pricing(variant: ProductVariant, monkeypatch, settings):
+def test_variant_pricing(variant: ProductVariant, monkeypatch, settings, stock):
     taxed_price = TaxedMoney(Money("10.0", "USD"), Money("12.30", "USD"))
     monkeypatch.setattr(
-        ExtensionsManager, "apply_taxes_to_product", Mock(return_value=taxed_price)
+        PluginsManager, "apply_taxes_to_product", Mock(return_value=taxed_price)
     )
 
     pricing = get_variant_availability(variant)
@@ -118,12 +116,10 @@ def test_variant_pricing(variant: ProductVariant, monkeypatch, settings):
     settings.DEFAULT_COUNTRY = "PL"
     settings.OPENEXCHANGERATES_API_KEY = "fake-key"
 
-    pricing = get_variant_availability(variant, local_currency="PLN")
-    assert pricing.price_local_currency.currency == "PLN"
-    assert pricing.available
+    pricing = get_variant_availability(variant, local_currency="PLN", country="US")
+    assert pricing.price_local_currency.currency == "PLN"  # type: ignore
 
     pricing = get_variant_availability(variant)
     assert pricing.price.tax.amount
     assert pricing.price_undiscounted.tax.amount
     assert pricing.price_undiscounted.tax.amount
-    assert pricing.available

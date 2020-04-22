@@ -7,12 +7,10 @@ from braintree.errors import Errors
 from braintree.validation_error import ValidationError
 from django.core.exceptions import ImproperlyConfigured
 
-from saleor.extensions.manager import get_extensions_manager
 from saleor.payment.gateways.braintree import (
     TransactionKind,
     authorize,
     capture,
-    create_form,
     extract_gateway_response,
     get_braintree_gateway,
     get_client_token,
@@ -26,7 +24,6 @@ from saleor.payment.gateways.braintree.errors import (
     DEFAULT_ERROR_MESSAGE,
     BraintreeException,
 )
-from saleor.payment.gateways.braintree.forms import BraintreePaymentForm
 from saleor.payment.interface import (
     CreditCardInfo,
     CustomerSource,
@@ -87,7 +84,6 @@ def braintree_error_response(braintree_error):
 def gateway_config():
     return GatewayConfig(
         gateway_name="braintree",
-        template_path="template.html",
         auto_capture=False,
         store_customer=False,
         connection_params={
@@ -236,29 +232,6 @@ def test_get_client_token_with_no_customer_id_when_disabled(
     mock_gateway.assert_called_once_with(**gateway_config.connection_params)
     mock_generate.assert_called_once_with({})
     assert token == expected_token
-
-
-def test_braintree_payment_form_incorrect_amount(payment_dummy):
-    amount = Decimal("0.01")
-    data = {"amount": amount, "payment_method_nonce": "fake-nonce"}
-    assert amount != payment_dummy.total
-    payment_info = create_payment_information(payment_dummy)
-
-    form = BraintreePaymentForm(data=data, payment_information=payment_info)
-    assert not form.is_valid()
-    assert form.non_field_errors
-
-
-def test_braintree_payment_form(payment_dummy):
-    payment = payment_dummy
-
-    data = {"amount": payment.total, "payment_method_nonce": "fake-nonce"}
-    payment_info = create_payment_information(payment)
-
-    form = create_form(data=data, payment_information=payment_info)
-
-    assert isinstance(form, BraintreePaymentForm)
-    assert form.is_valid()
 
 
 @pytest.mark.integration
@@ -440,35 +413,3 @@ def test_list_customer_sources(sandbox_braintree_gateway_config):
     )
     sources = list_client_sources(sandbox_braintree_gateway_config, CUSTOMER_ID)
     assert sources == [expected_customer_source]
-
-
-def test_get_plugin_configuration_hides_all_braintree_secrets(settings):
-    settings.PLUGINS = [
-        "saleor.payment.gateways.braintree.plugin.BraintreeGatewayPlugin"
-    ]
-    manager = get_extensions_manager()
-    manager.get_plugin_configuration("Braintree")
-    manager.save_plugin_configuration(
-        "Braintree",
-        {
-            "configuration": [
-                {"name": "Public API key", "value": "123"},
-                {"name": "Merchant ID", "value": "456"},
-                {"name": "Secret API key", "value": "456"},
-            ]
-        },
-    )
-    plugin_configuration = manager.get_plugin_configuration("Braintree")
-    configuration = plugin_configuration.configuration
-    public_api_key = [
-        field for field in configuration if field["name"] == "Public API key"
-    ][0]
-    secret_api_key = [
-        field for field in configuration if field["name"] == "Secret API key"
-    ][0]
-    merchant_id = [field for field in configuration if field["name"] == "Merchant ID"][
-        0
-    ]
-    assert public_api_key["value"] == "*" * 10
-    assert secret_api_key["value"] == "*" * 10
-    assert merchant_id["value"] == "*" * 10

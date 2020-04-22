@@ -1,17 +1,17 @@
 import graphene
+from django.core.exceptions import ValidationError
 
-from ...core.utils.promo_code import (
-    PromoCodeAlreadyExists,
-    generate_promo_code,
-    is_available_promo_code,
-)
+from ...core.permissions import DiscountPermissions
+from ...core.utils.promo_code import generate_promo_code, is_available_promo_code
 from ...discount import models
+from ...discount.error_codes import DiscountErrorCode
 from ...product.tasks import (
     update_products_minimal_variant_prices_of_catalogues_task,
     update_products_minimal_variant_prices_of_discount_task,
 )
 from ..core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ..core.scalars import Decimal
+from ..core.types.common import DiscountError
 from ..product.types import Category, Collection, Product
 from .enums import DiscountValueTypeEnum, VoucherTypeEnum
 from .types import Sale, Voucher
@@ -85,7 +85,7 @@ class VoucherInput(graphene.InputObjectType):
         description=("Voucher type: PRODUCT, CATEGORY SHIPPING or ENTIRE_ORDER.")
     )
     name = graphene.String(description="Voucher name.")
-    code = graphene.String(decription="Code to use the voucher.")
+    code = graphene.String(description="Code to use the voucher.")
     start_date = graphene.types.datetime.DateTime(
         description="Start date of the voucher in ISO 8601 format."
     )
@@ -139,7 +139,9 @@ class VoucherCreate(ModelMutation):
     class Meta:
         description = "Creates a new voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
@@ -147,7 +149,14 @@ class VoucherCreate(ModelMutation):
         if code == "":
             data["code"] = generate_promo_code()
         elif not is_available_promo_code(code):
-            raise PromoCodeAlreadyExists()
+            raise ValidationError(
+                {
+                    "code": ValidationError(
+                        "Promo code already exists.",
+                        code=DiscountErrorCode.ALREADY_EXISTS,
+                    )
+                }
+            )
         cleaned_input = super().clean_input(info, instance, data)
 
         min_spent_amount = cleaned_input.pop("min_amount_spent", None)
@@ -166,7 +175,9 @@ class VoucherUpdate(VoucherCreate):
     class Meta:
         description = "Updates a voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
 
 class VoucherDelete(ModelDeleteMutation):
@@ -176,7 +187,9 @@ class VoucherDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
 
 class VoucherBaseCatalogueMutation(BaseDiscountCatalogueMutation):
@@ -198,7 +211,9 @@ class VoucherBaseCatalogueMutation(BaseDiscountCatalogueMutation):
 class VoucherAddCatalogues(VoucherBaseCatalogueMutation):
     class Meta:
         description = "Adds products, categories, collections to a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -212,7 +227,9 @@ class VoucherAddCatalogues(VoucherBaseCatalogueMutation):
 class VoucherRemoveCatalogues(VoucherBaseCatalogueMutation):
     class Meta:
         description = "Removes products, categories, collections from a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -266,7 +283,9 @@ class SaleCreate(SaleUpdateMinimalVariantPriceMixin, ModelMutation):
     class Meta:
         description = "Creates a new sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
 
 class SaleUpdate(SaleUpdateMinimalVariantPriceMixin, ModelMutation):
@@ -279,7 +298,9 @@ class SaleUpdate(SaleUpdateMinimalVariantPriceMixin, ModelMutation):
     class Meta:
         description = "Updates a sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
 
 class SaleDelete(SaleUpdateMinimalVariantPriceMixin, ModelDeleteMutation):
@@ -289,7 +310,9 @@ class SaleDelete(SaleUpdateMinimalVariantPriceMixin, ModelDeleteMutation):
     class Meta:
         description = "Deletes a sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
 
 class SaleBaseCatalogueMutation(BaseDiscountCatalogueMutation):
@@ -311,7 +334,9 @@ class SaleBaseCatalogueMutation(BaseDiscountCatalogueMutation):
 class SaleAddCatalogues(SaleBaseCatalogueMutation):
     class Meta:
         description = "Adds products, categories, collections to a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -325,7 +350,9 @@ class SaleAddCatalogues(SaleBaseCatalogueMutation):
 class SaleRemoveCatalogues(SaleBaseCatalogueMutation):
     class Meta:
         description = "Removes products, categories, collections from a sale."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
+        error_type_class = DiscountError
+        error_type_field = "discount_errors"
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):

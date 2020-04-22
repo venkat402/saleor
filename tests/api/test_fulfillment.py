@@ -3,8 +3,10 @@ from unittest.mock import patch
 import graphene
 import pytest
 
+from saleor.core.permissions import OrderPermissions
 from saleor.order.events import OrderEvents
 from saleor.order.models import FulfillmentStatus
+from saleor.warehouse.models import Allocation
 from tests.api.utils import assert_no_permission, get_graphql_content
 
 CREATE_FULFILLMENT_QUERY = """
@@ -161,8 +163,12 @@ def test_create_fulfillment_with_invalid_input(
     )
 
 
+@patch("saleor.order.emails.send_fulfillment_update.delay")
 def test_fulfillment_update_tracking(
-    staff_api_client, fulfillment, permission_manage_orders
+    send_fulfillment_update_mock,
+    staff_api_client,
+    fulfillment,
+    permission_manage_orders,
 ):
     query = """
     mutation updateFulfillment($id: ID!, $tracking: String) {
@@ -183,6 +189,64 @@ def test_fulfillment_update_tracking(
     content = get_graphql_content(response)
     data = content["data"]["orderFulfillmentUpdateTracking"]["fulfillment"]
     assert data["trackingNumber"] == tracking
+    send_fulfillment_update_mock.assert_not_called()
+
+
+FULFILLMENT_UPDATE_TRACKING_WITH_SEND_NOTIFICATION_QUERY = """
+    mutation updateFulfillment($id: ID!, $tracking: String, $notifyCustomer: Boolean) {
+            orderFulfillmentUpdateTracking(
+                id: $id
+                input: {trackingNumber: $tracking, notifyCustomer: $notifyCustomer}) {
+                    fulfillment {
+                        trackingNumber
+                    }
+                }
+        }
+    """
+
+
+@patch("saleor.order.emails.send_fulfillment_update.delay")
+def test_fulfillment_update_tracking_send_notification_true(
+    send_fulfillment_update_mock,
+    staff_api_client,
+    fulfillment,
+    permission_manage_orders,
+):
+    fulfillment_id = graphene.Node.to_global_id("Fulfillment", fulfillment.id)
+    tracking = "stationary tracking"
+    variables = {"id": fulfillment_id, "tracking": tracking, "notifyCustomer": True}
+    response = staff_api_client.post_graphql(
+        FULFILLMENT_UPDATE_TRACKING_WITH_SEND_NOTIFICATION_QUERY,
+        variables,
+        permissions=[permission_manage_orders],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["orderFulfillmentUpdateTracking"]["fulfillment"]
+    assert data["trackingNumber"] == tracking
+    send_fulfillment_update_mock.assert_called_once_with(
+        fulfillment.order.pk, fulfillment.pk
+    )
+
+
+@patch("saleor.order.emails.send_fulfillment_update.delay")
+def test_fulfillment_update_tracking_send_notification_false(
+    send_fulfillment_update_mock,
+    staff_api_client,
+    fulfillment,
+    permission_manage_orders,
+):
+    fulfillment_id = graphene.Node.to_global_id("Fulfillment", fulfillment.id)
+    tracking = "stationary tracking"
+    variables = {"id": fulfillment_id, "tracking": tracking, "notifyCustomer": False}
+    response = staff_api_client.post_graphql(
+        FULFILLMENT_UPDATE_TRACKING_WITH_SEND_NOTIFICATION_QUERY,
+        variables,
+        permissions=[permission_manage_orders],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["orderFulfillmentUpdateTracking"]["fulfillment"]
+    assert data["trackingNumber"] == tracking
+    send_fulfillment_update_mock.assert_not_called()
 
 
 def test_cancel_fulfillment_restock_items(
@@ -260,6 +324,11 @@ def test_create_digital_fulfillment(
     order_line = order.lines.first()
     order_line.variant = digital_content.product_variant
     order_line.save()
+
+    stock = digital_content.product_variant.stocks.first()
+    Allocation.objects.create(
+        order_line=order_line, stock=stock, quantity_allocated=order_line.quantity
+    )
 
     second_line = order.lines.last()
     first_line_id = graphene.Node.to_global_id("OrderLine", order_line.id)
@@ -342,7 +411,7 @@ def clear_meta_variables(fulfillment):
     fulfillment_id = graphene.Node.to_global_id("Fulfillment", fulfillment.id)
     return {
         "id": fulfillment_id,
-        "input": {"namespace": "test", "clientName": "client1", "key": "foo"},
+        "input": {"namespace": "", "clientName": "", "key": "foo"},
     }
 
 
@@ -352,9 +421,9 @@ def update_metadata_variables(staff_user, fulfillment):
     return {
         "id": fulfillment_id,
         "input": {
-            "namespace": "test",
-            "clientName": str(staff_user),
-            "key": "foo",
+            "namespace": "",
+            "clientName": "",
+            "key": str(staff_user),
             "value": "bar",
         },
     }
@@ -363,7 +432,7 @@ def update_metadata_variables(staff_user, fulfillment):
 def test_fulfillment_update_metadata_user_has_no_permision(
     staff_api_client, staff_user, update_metadata_mutation, update_metadata_variables
 ):
-    assert not staff_user.has_perm("order.manage_orders")
+    assert not staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
 
     response = staff_api_client.post_graphql(
         update_metadata_mutation,
@@ -383,7 +452,7 @@ def test_fulfillment_update_metadata_user_has_permission(
     update_metadata_variables,
 ):
     staff_user.user_permissions.add(permission_manage_orders)
-    assert staff_user.has_perm("order.manage_orders")
+    assert staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
     response = staff_api_client.post_graphql(
         update_metadata_mutation,
         update_metadata_variables,
@@ -395,16 +464,16 @@ def test_fulfillment_update_metadata_user_has_permission(
     errors = content["data"]["orderFulfillmentUpdateMeta"]["errors"]
     assert len(errors) == 0
     fulfillment.refresh_from_db()
-    assert fulfillment.meta == {"test": {str(staff_user): {"foo": "bar"}}}
+    assert fulfillment.metadata == {str(staff_user): "bar"}
 
 
-def test_fulfillment_update_private_metadata_user_has_no_permision(
+def test_fulfillment_update_private_metadata_user_has_no_permission(
     staff_api_client,
     staff_user,
     update_private_metadata_mutation,
     update_metadata_variables,
 ):
-    assert not staff_user.has_perm("order.manage_orders")
+    assert not staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
 
     response = staff_api_client.post_graphql(
         update_private_metadata_mutation,
@@ -424,7 +493,7 @@ def test_fulfillment_update_private_metadata_user_has_permission(
     update_metadata_variables,
 ):
     staff_user.user_permissions.add(permission_manage_orders)
-    assert staff_user.has_perm("order.manage_orders")
+    assert staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
     response = staff_api_client.post_graphql(
         update_private_metadata_mutation,
         update_metadata_variables,
@@ -436,7 +505,7 @@ def test_fulfillment_update_private_metadata_user_has_permission(
     errors = content["data"]["orderFulfillmentUpdatePrivateMeta"]["errors"]
     assert len(errors) == 0
     fulfillment.refresh_from_db()
-    assert fulfillment.private_meta == {"test": {str(staff_user): {"foo": "bar"}}}
+    assert fulfillment.private_metadata == {str(staff_user): "bar"}
 
 
 def test_fulfillment_clear_meta_user_has_no_permission(
@@ -446,8 +515,8 @@ def test_fulfillment_clear_meta_user_has_no_permission(
     clear_meta_variables,
     clear_metadata_mutation,
 ):
-    assert not staff_user.has_perm("order.manage_orders")
-    fulfillment.store_meta(namespace="test", client=staff_user, item={"foo": "bar"})
+    assert not staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
+    fulfillment.store_value_in_metadata(items={"foo": "bar"})
     fulfillment.save()
     response = staff_api_client.post_graphql(
         clear_metadata_mutation, clear_meta_variables
@@ -464,8 +533,8 @@ def test_fulfillment_clear_meta_user_has_permission(
     clear_metadata_mutation,
 ):
     staff_user.user_permissions.add(permission_manage_orders)
-    assert staff_user.has_perm("order.manage_orders")
-    fulfillment.store_meta(namespace="test", client="client1", item={"foo": "bar"})
+    assert staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
+    fulfillment.store_value_in_metadata(items={"foo": "bar"})
     fulfillment.save()
     fulfillment.refresh_from_db()
     response = staff_api_client.post_graphql(
@@ -475,7 +544,7 @@ def test_fulfillment_clear_meta_user_has_permission(
     content = get_graphql_content(response)
     assert content.get("errors") is None
     fulfillment.refresh_from_db()
-    assert fulfillment.get_meta(namespace="test", client="client1") == {}
+    assert not fulfillment.get_value_from_metadata(key="foo")
 
 
 def test_fulfillment_clear_private_meta_user_has_no_permission(
@@ -485,10 +554,8 @@ def test_fulfillment_clear_private_meta_user_has_no_permission(
     clear_meta_variables,
     clear_private_metadata_mutation,
 ):
-    assert not staff_user.has_perm("order.manage_orders")
-    fulfillment.store_private_meta(
-        namespace="test", client="client1", item={"foo": "bar"}
-    )
+    assert not staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
+    fulfillment.store_value_in_private_metadata(items={"foo": "bar"})
     fulfillment.save()
     response = staff_api_client.post_graphql(
         clear_private_metadata_mutation, clear_meta_variables
@@ -505,10 +572,8 @@ def test_fulfillment_clear_private_meta_user_has_permission(
     clear_private_metadata_mutation,
 ):
     staff_user.user_permissions.add(permission_manage_orders)
-    assert staff_user.has_perm("order.manage_orders")
-    fulfillment.store_private_meta(
-        namespace="test", client="client1", item={"foo": "bar"}
-    )
+    assert staff_user.has_perm(OrderPermissions.MANAGE_ORDERS)
+    fulfillment.store_value_in_private_metadata(items={"foo": "bar"})
     fulfillment.save()
     fulfillment.refresh_from_db()
     response = staff_api_client.post_graphql(
@@ -518,4 +583,4 @@ def test_fulfillment_clear_private_meta_user_has_permission(
     content = get_graphql_content(response)
     assert content.get("errors") is None
     fulfillment.refresh_from_db()
-    assert fulfillment.get_private_meta(namespace="test", client="client1") == {}
+    assert not fulfillment.get_value_from_private_metadata(key="foo")

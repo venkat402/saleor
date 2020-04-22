@@ -1,14 +1,15 @@
 from typing import Union
 
 import graphene
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.utils import timezone
 from graphene_django.registry import get_global_registry
 from graphql.error import GraphQLError
+from graphql_jwt.utils import jwt_payload
 from graphql_relay import from_global_id
 
 from .core.enums import PermissionEnum, ReportingPeriod
-from .core.types import PermissionDisplay
+from .core.types import PermissionDisplay, SortInputObjectType
 
 ERROR_COULD_NO_RESOLVE_GLOBAL_ID = (
     "Could not resolve to a node with the global id list of '%s'."
@@ -24,14 +25,7 @@ def get_database_id(info, node_id, only_type):
     return _id
 
 
-def _check_graphene_type(requested_graphene_type, received_type):
-    if requested_graphene_type:
-        assert str(requested_graphene_type) == received_type, (
-            "Must receive an {} id."
-        ).format(str(requested_graphene_type))
-
-
-def _resolve_nodes(ids, graphene_type=None):
+def resolve_global_ids_to_primary_keys(ids, graphene_type=None):
     pks = []
     invalid_ids = []
     used_type = graphene_type
@@ -46,7 +40,10 @@ def _resolve_nodes(ids, graphene_type=None):
             invalid_ids.append(graphql_id)
             continue
 
-        _check_graphene_type(used_type, node_type)
+        # Raise GraphQL error if ID of a different type was passed
+        if used_type and str(used_type) != str(node_type):
+            raise GraphQLError(f"Must receive {str(used_type)} id: {graphql_id}")
+
         used_type = node_type
         pks.append(_id)
 
@@ -60,7 +57,7 @@ def _resolve_graphene_type(type_name):
     for _, _type in registry._registry.items():
         if _type._meta.name == type_name:
             return _type
-    raise AssertionError("Could not resolve the type {}".format(type_name))
+    raise GraphQLError("Could not resolve the type {}".format(type_name))
 
 
 def get_nodes(
@@ -75,7 +72,7 @@ def get_nodes(
 
     If the `graphene_type` is of type str, the model keyword argument must be provided.
     """
-    nodes_type, pks = _resolve_nodes(ids, graphene_type)
+    nodes_type, pks = resolve_global_ids_to_primary_keys(ids, graphene_type)
 
     # If `graphene_type` was not provided, check if all resolved types are
     # the same. This prevents from accidentally mismatching IDs of different
@@ -83,7 +80,7 @@ def get_nodes(
     if nodes_type and not graphene_type:
         graphene_type = _resolve_graphene_type(nodes_type)
 
-    if qs is None and not isinstance(graphene_type, str):
+    if qs is None and graphene_type and not isinstance(graphene_type, str):
         qs = graphene_type._meta.model.objects
     elif model is not None:
         qs = model.objects
@@ -122,6 +119,28 @@ def filter_by_query_param(queryset, query, search_fields):
     return queryset
 
 
+def sort_queryset(
+    queryset: QuerySet, sort_by: SortInputObjectType, sort_enum: graphene.Enum
+) -> QuerySet:
+    """Sort queryset according to given parameters.
+
+    Keyword Arguments:
+        queryset - queryset to be filtered
+        sort_by - dictionary with sorting field and direction
+
+    """
+    if sort_by is None or not sort_by.field:
+        return queryset
+
+    direction = sort_by.direction
+    sorting_field = sort_by.field
+
+    custom_sort_by = getattr(sort_enum, f"sort_by_{sorting_field}", None)
+    if custom_sort_by:
+        return custom_sort_by(queryset, sort_by)
+    return queryset.order_by(f"{direction}{sorting_field}")
+
+
 def reporting_period_to_date(period):
     now = timezone.now()
     if period == ReportingPeriod.TODAY:
@@ -138,16 +157,6 @@ def filter_by_period(queryset, period, field_name):
     return queryset.filter(**{"%s__gte" % field_name: start_date})
 
 
-def generate_query_argument_description(search_fields):
-    deprecated_info = (
-        "DEPRECATED: Will be removed in Saleor 2.10,"
-        " use `filter: {search: {}}` instead.\n"
-    )
-    header = "Supported filter parameters:\n"
-    supported_list = [f"`{field}`" for field in search_fields]
-    return deprecated_info + header + ", ".join(supported_list)
-
-
 def format_permissions_for_display(permissions):
     """Transform permissions queryset into PermissionDisplay list.
 
@@ -162,3 +171,28 @@ def format_permissions_for_display(permissions):
             PermissionDisplay(code=PermissionEnum.get(codename), name=permission.name)
         )
     return formatted_permissions
+
+
+def create_jwt_payload(user, context=None):
+    payload = jwt_payload(user, context)
+    payload["user_id"] = graphene.Node.to_global_id("User", user.id)
+    payload["is_staff"] = user.is_staff
+    payload["is_superuser"] = user.is_superuser
+    return payload
+
+
+def get_user_or_service_account_from_context(context):
+    # order is important
+    # service_account can be None but user if None then is passed as anonymous
+    return context.service_account or context.user
+
+
+def filter_range_field(qs, field, value):
+    gte, lte = value.get("gte"), value.get("lte")
+    if gte:
+        lookup = {f"{field}__gte": gte}
+        qs = qs.filter(**lookup)
+    if lte:
+        lookup = {f"{field}__lte": lte}
+        qs = qs.filter(**lookup)
+    return qs

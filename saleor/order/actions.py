@@ -3,12 +3,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, List
 
 from django.db import transaction
-from django.utils.translation import pgettext_lazy
 
 from ..core import analytics
-from ..extensions.manager import get_extensions_manager
+from ..plugins.manager import get_plugins_manager
 from ..payment import ChargeStatus, CustomPaymentChoices, PaymentError
-from ..product.utils import decrease_stock
+from ..warehouse.management import decrease_stock
 from . import FulfillmentStatus, OrderStatus, emails, events, utils
 from .emails import send_fulfillment_confirmation_to_customer, send_payment_confirmation
 from .models import Fulfillment, FulfillmentLine
@@ -21,7 +20,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from .models import Order
-    from ..account.models import User, Address
+    from ..account.models import User
     from ..payment.models import Payment
 
 
@@ -30,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def order_created(order: "Order", user: "User", from_draft: bool = False):
     events.order_created_event(order=order, user=user, from_draft=from_draft)
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     manager.order_created(order)
 
 
@@ -50,7 +49,7 @@ def handle_fully_paid_order(order: "Order"):
     except Exception:
         # Analytics failing should not abort the checkout flow
         logger.exception("Recording order in analytics failed")
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     manager.order_fully_paid(order)
     manager.order_updated(order)
 
@@ -86,7 +85,7 @@ def cancel_order(order: "Order", user: "User", restock: bool):
         elif payment.can_void():
             gateway.void(payment)
 
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     manager.order_cancelled(order)
     manager.order_updated(order)
 
@@ -95,12 +94,12 @@ def order_refunded(order: "Order", user: "User", amount: "Decimal", payment: "Pa
     events.payment_refunded_event(
         order=order, user=user, amount=amount, payment=payment
     )
-    get_extensions_manager().order_updated(order)
+    get_plugins_manager().order_updated(order)
 
 
 def order_voided(order: "Order", user: "User", payment: "Payment"):
     events.payment_voided_event(order=order, user=user, payment=payment)
-    get_extensions_manager().order_updated(order)
+    get_plugins_manager().order_updated(order)
 
 
 def order_fulfilled(
@@ -114,8 +113,9 @@ def order_fulfilled(
     events.fulfillment_fulfilled_items_event(
         order=order, user=user, fulfillment_lines=fulfillment_lines
     )
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     manager.order_updated(order)
+    manager.fulfillment_created(fulfillment)
 
     if order.status == OrderStatus.FULFILLED:
         manager.order_fulfilled(order)
@@ -126,19 +126,14 @@ def order_fulfilled(
 
 def order_shipping_updated(order: "Order"):
     recalculate_order(order)
-    get_extensions_manager().order_updated(order)
-
-
-def order_address_updated(order: "Order", user: "User", address: "Address"):
-    events.order_updated_address_event(order=order, user=user, address=address)
-    get_extensions_manager().order_updated(order)
+    get_plugins_manager().order_updated(order)
 
 
 def order_captured(order: "Order", user: "User", amount: "Decimal", payment: "Payment"):
     events.payment_captured_event(
         order=order, user=user, amount=amount, payment=payment
     )
-    get_extensions_manager().order_updated(order)
+    get_plugins_manager().order_updated(order)
 
 
 def fulfillment_tracking_updated(
@@ -150,7 +145,7 @@ def fulfillment_tracking_updated(
         tracking_number=tracking_number,
         fulfillment=fulfillment,
     )
-    get_extensions_manager().order_updated(fulfillment.order)
+    get_plugins_manager().order_updated(fulfillment.order)
 
 
 def cancel_fulfillment(fulfillment: "Fulfillment", user: "User", restock: bool):
@@ -173,7 +168,7 @@ def cancel_fulfillment(fulfillment: "Fulfillment", user: "User", restock: bool):
     fulfillment.status = FulfillmentStatus.CANCELED
     fulfillment.save(update_fields=["status"])
     update_order_status(fulfillment.order)
-    get_extensions_manager().order_updated(fulfillment.order)
+    get_plugins_manager().order_updated(fulfillment.order)
 
 
 @transaction.atomic
@@ -191,16 +186,15 @@ def mark_order_as_paid(order: "Order", request_user: "User"):
         payment_token="",
         currency=order.total.gross.currency,
         email=order.user_email,
-        billing_address=order.billing_address,
         total=order.total.gross.amount,
         order=order,
     )
     payment.charge_status = ChargeStatus.FULLY_CHARGED
     payment.captured_amount = order.total.gross.amount
-    payment.save(update_fields=["captured_amount", "charge_status"])
+    payment.save(update_fields=["captured_amount", "charge_status", "modified"])
 
     events.order_manually_marked_as_paid_event(order=order, user=request_user)
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     manager.order_fully_paid(order)
     manager.order_updated(order)
 
@@ -208,18 +202,13 @@ def mark_order_as_paid(order: "Order", request_user: "User"):
 def clean_mark_order_as_paid(order: "Order"):
     """Check if an order can be marked as paid."""
     if order.payments.exists():
-        raise PaymentError(
-            pgettext_lazy(
-                "Mark order as paid validation error",
-                "Orders with payments can not be manually marked as paid.",
-            )
-        )
+        raise PaymentError("Orders with payments can not be manually marked as paid.",)
 
 
 def fulfill_order_line(order_line, quantity):
     """Fulfill order line with given quantity."""
     if order_line.variant and order_line.variant.track_inventory:
-        decrease_stock(order_line.variant, quantity)
+        decrease_stock(order_line, quantity)
     order_line.quantity_fulfilled += quantity
     order_line.save(update_fields=["quantity_fulfilled"])
 
@@ -240,8 +229,9 @@ def automatically_fulfill_digital_lines(order: "Order"):
     for line in digital_lines:
         if not order_line_needs_automatic_fulfillment(line):
             continue
-        digital_content = line.variant.digital_content
-        digital_content.urls.create(line=line)
+        if line.variant:
+            digital_content = line.variant.digital_content
+            digital_content.urls.create(line=line)
         quantity = line.quantity
         FulfillmentLine.objects.create(
             fulfillment=fulfillment, order_line=line, quantity=quantity

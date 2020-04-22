@@ -2,30 +2,41 @@ from functools import wraps
 
 from django.conf import settings
 from django.db import transaction
-from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
 from prices import Money, TaxedMoney
 
-from ..account.utils import store_user_address
-from ..checkout import AddressType
+from ..account.models import User
 from ..core.taxes import zero_money
 from ..core.weight import zero_weight
-from ..dashboard.order.utils import get_voucher_discount_for_order
-from ..discount.models import NotApplicable
-from ..extensions.manager import get_extensions_manager
+from ..discount.models import NotApplicable, Voucher, VoucherType
+from ..discount.utils import get_products_voucher_discount, validate_voucher_in_order
 from ..order import OrderStatus
 from ..order.models import Order, OrderLine
-from ..product.utils import allocate_stock, deallocate_stock, increase_stock
+from ..plugins.manager import get_plugins_manager
 from ..product.utils.digital_products import get_default_digital_content_settings
 from ..shipping.models import ShippingMethod
+from ..warehouse.management import deallocate_stock, increase_stock
+from ..warehouse.models import Warehouse
 from . import events
+
+
+def get_order_country(order: Order) -> str:
+    """Return country to which order will be shipped."""
+    address = order.billing_address
+    if order.is_shipping_required():
+        address = order.shipping_address
+    if address is None:
+        return settings.DEFAULT_COUNTRY
+    return address.country.code
 
 
 def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
     """Check if given line is digital and should be automatically fulfilled."""
     digital_content_settings = get_default_digital_content_settings()
     default_automatic_fulfillment = digital_content_settings["automatic_fulfillment"]
-    content = line.variant.digital_content
+    content = line.variant.digital_content if line.variant else None
+    if not content:
+        return False
     if default_automatic_fulfillment and content.use_default_settings:
         return True
     if content.automatic_fulfillment:
@@ -39,28 +50,6 @@ def order_needs_automatic_fullfilment(order: Order) -> bool:
         if order_line_needs_automatic_fulfillment(line):
             return True
     return False
-
-
-def check_order_status(func):
-    """Check if order meets preconditions of payment process.
-
-    Order can not have draft status or be fully paid. Billing address
-    must be provided.
-    If not, redirect to order details page.
-    """
-    # pylint: disable=cyclic-import
-    from .models import Order
-
-    @wraps(func)
-    def decorator(*args, **kwargs):
-        token = kwargs.pop("token")
-        order = get_object_or_404(Order.objects.confirmed(), token=token)
-        if not order.billing_address or order.is_fully_paid():
-            return redirect("order:details", token=order.token)
-        kwargs["order"] = order
-        return func(*args, **kwargs)
-
-    return decorator
 
 
 def update_voucher_discount(func):
@@ -99,7 +88,14 @@ def recalculate_order(order: Order, **kwargs):
     if order.discount:
         total -= order.discount
     order.total = total
-    order.save()
+    order.save(
+        update_fields=[
+            "discount_amount",
+            "total_net_amount",
+            "total_gross_amount",
+            "currency",
+        ]
+    )
     recalculate_order_weight(order)
 
 
@@ -115,7 +111,7 @@ def recalculate_order_weight(order):
 
 def update_order_prices(order, discounts):
     """Update prices in order with given discounts and proper taxes."""
-    manager = get_extensions_manager()
+    manager = get_plugins_manager()
     for line in order:  # type: OrderLine
         if line.variant:
             unit_price = line.variant.get_price(discounts)
@@ -138,7 +134,13 @@ def update_order_prices(order, discounts):
 
     if order.shipping_method:
         order.shipping_price = manager.calculate_order_shipping(order)
-        order.save()
+        order.save(
+            update_fields=[
+                "shipping_price_net_amount",
+                "shipping_price_gross_amount",
+                "currency",
+            ]
+        )
 
     recalculate_order(order)
 
@@ -160,33 +162,12 @@ def update_order_status(order):
         order.save(update_fields=["status"])
 
 
-def attach_order_to_user(order, user):
-    """Associate existing order with user account."""
-    order.user = user
-    store_user_address(user, order.billing_address, AddressType.BILLING)
-    if order.shipping_address:
-        store_user_address(user, order.shipping_address, AddressType.SHIPPING)
-    order.save(update_fields=["user"])
-
-
 @transaction.atomic
-def add_variant_to_order(
-    order,
-    variant,
-    quantity,
-    discounts=None,
-    allow_overselling=False,
-    track_inventory=True,
-):
+def add_variant_to_draft_order(order, variant, quantity, discounts=None):
     """Add total_quantity of variant to order.
 
     Returns an order line the variant was added to.
-
-    By default, raises InsufficientStock exception if  quantity could not be
-    fulfilled. This can be disabled by setting `allow_overselling` to True.
     """
-    if not allow_overselling:
-        variant.check_quantity(quantity)
 
     try:
         line = order.lines.get(variant=variant)
@@ -215,7 +196,7 @@ def add_variant_to_order(
             unit_price=unit_price,
             variant=variant,
         )
-        manager = get_extensions_manager()
+        manager = get_plugins_manager()
         unit_price = manager.calculate_order_line_unit(line)
         line.unit_price = unit_price
         line.tax_rate = unit_price.tax / unit_price.net
@@ -228,8 +209,6 @@ def add_variant_to_order(
             ]
         )
 
-    if variant.track_inventory and track_inventory:
-        allocate_stock(variant, quantity)
     return line
 
 
@@ -279,12 +258,21 @@ def delete_order_line(line):
 
 def restock_order_lines(order):
     """Return ordered products to corresponding stocks."""
+    country = get_order_country(order)
+    default_warehouse = Warehouse.objects.filter(
+        shipping_zones__countries__contains=country
+    ).first()
+
     for line in order:
         if line.variant and line.variant.track_inventory:
             if line.quantity_unfulfilled > 0:
-                deallocate_stock(line.variant, line.quantity_unfulfilled)
+                deallocate_stock(line, line.quantity_unfulfilled)
             if line.quantity_fulfilled > 0:
-                increase_stock(line.variant, line.quantity_fulfilled)
+                allocation = line.allocations.first()
+                warehouse = (
+                    allocation.stock.warehouse if allocation else default_warehouse
+                )
+                increase_stock(line, warehouse, line.quantity_fulfilled)
 
         if line.quantity_fulfilled > 0:
             line.quantity_fulfilled = 0
@@ -293,9 +281,16 @@ def restock_order_lines(order):
 
 def restock_fulfillment_lines(fulfillment):
     """Return fulfilled products to corresponding stocks."""
+    country = get_order_country(fulfillment.order)
+    default_warehouse = Warehouse.objects.filter(
+        shipping_zones__countries__contains=country
+    ).first()
+
     for line in fulfillment:
         if line.order_line.variant and line.order_line.variant.track_inventory:
-            increase_stock(line.order_line.variant, line.quantity, allocate=True)
+            allocation = line.order_line.allocations.first()
+            warehouse = allocation.stock.warehouse if allocation else default_warehouse
+            increase_stock(line.order_line, warehouse, line.quantity, allocate=True)
 
 
 def sum_order_totals(qs):
@@ -308,3 +303,34 @@ def get_valid_shipping_methods_for_order(order: Order):
     return ShippingMethod.objects.applicable_shipping_methods_for_instance(
         order, price=order.get_subtotal().gross
     )
+
+
+def get_products_voucher_discount_for_order(voucher: Voucher) -> Money:
+    """Calculate products discount value for a voucher, depending on its type."""
+    prices = None
+    if not prices:
+        msg = "This offer is only valid for selected items."
+        raise NotApplicable(msg)
+    return get_products_voucher_discount(voucher, prices)
+
+
+def get_voucher_discount_for_order(order: Order) -> Money:
+    """Calculate discount value depending on voucher and discount types.
+
+    Raise NotApplicable if voucher of given type cannot be applied.
+    """
+    if not order.voucher:
+        return zero_money(order.currency)
+    validate_voucher_in_order(order)
+    subtotal = order.get_subtotal()
+    if order.voucher.type == VoucherType.ENTIRE_ORDER:
+        return order.voucher.get_discount_amount_for(subtotal.gross)
+    if order.voucher.type == VoucherType.SHIPPING:
+        return order.voucher.get_discount_amount_for(order.shipping_price)
+    if order.voucher.type == VoucherType.SPECIFIC_PRODUCT:
+        return get_products_voucher_discount_for_order(order.voucher)
+    raise NotImplementedError("Unknown discount type")
+
+
+def match_orders_with_new_user(user: User) -> None:
+    Order.objects.confirmed().filter(user_email=user.email, user=None).update(user=user)

@@ -1,37 +1,52 @@
+import datetime
 import uuid
+from contextlib import contextmanager
 from decimal import Decimal
+from functools import partial
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from django.contrib.auth.models import Permission
+from django.conf import settings
+from django.contrib.auth.models import Group, Permission
 from django.contrib.sites.models import Site
 from django.core.files import File
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.forms import ModelForm
-from django.test.client import Client
+from django.test.utils import CaptureQueriesContext as BaseCaptureQueriesContext
 from django_countries import countries
 from PIL import Image
 from prices import Money, TaxedMoney
 
-from saleor.account.backends import BaseBackend
-from saleor.account.models import Address, ServiceAccount, User
+from saleor.account.models import (
+    Address,
+    ServiceAccount,
+    StaffNotificationRecipient,
+    User,
+)
 from saleor.checkout import utils
 from saleor.checkout.models import Checkout
 from saleor.checkout.utils import add_variant_to_checkout
 from saleor.core.payments import PaymentInterface
 from saleor.discount import DiscountInfo, DiscountValueType, VoucherType
-from saleor.discount.models import Sale, Voucher, VoucherCustomer, VoucherTranslation
+from saleor.discount.models import (
+    Sale,
+    SaleTranslation,
+    Voucher,
+    VoucherCustomer,
+    VoucherTranslation,
+)
 from saleor.giftcard.models import GiftCard
-from saleor.menu.models import Menu, MenuItem
+from saleor.menu.models import Menu, MenuItem, MenuItemTranslation
 from saleor.menu.utils import update_menu
 from saleor.order import OrderStatus
 from saleor.order.actions import fulfill_order_line
 from saleor.order.events import OrderEvents
-from saleor.order.models import FulfillmentStatus, Order, OrderEvent
+from saleor.order.models import FulfillmentStatus, Order, OrderEvent, OrderLine
 from saleor.order.utils import recalculate_order
-from saleor.page.models import Page
+from saleor.page.models import Page, PageTranslation
 from saleor.payment import ChargeStatus, TransactionKind
 from saleor.payment.models import Payment
 from saleor.product import AttributeInputType
@@ -39,8 +54,11 @@ from saleor.product.models import (
     Attribute,
     AttributeTranslation,
     AttributeValue,
+    AttributeValueTranslation,
     Category,
+    CategoryTranslation,
     Collection,
+    CollectionTranslation,
     DigitalContent,
     DigitalContentUrl,
     Product,
@@ -48,14 +66,107 @@ from saleor.product.models import (
     ProductTranslation,
     ProductType,
     ProductVariant,
+    ProductVariantTranslation,
 )
 from saleor.product.utils.attributes import associate_attribute_values_to_instance
-from saleor.shipping.models import ShippingMethod, ShippingMethodType, ShippingZone
+from saleor.shipping.models import (
+    ShippingMethod,
+    ShippingMethodTranslation,
+    ShippingMethodType,
+    ShippingZone,
+)
 from saleor.site import AuthenticationBackends
 from saleor.site.models import AuthorizationKey, SiteSettings
-from saleor.webhook import WebhookEventType
+from saleor.warehouse.models import Allocation, Stock, Warehouse
+from saleor.webhook.event_types import WebhookEventType
 from saleor.webhook.models import Webhook
+from saleor.wishlist.models import Wishlist
 from tests.utils import create_image
+
+
+class CaptureQueriesContext(BaseCaptureQueriesContext):
+    IGNORED_QUERIES = settings.PATTERNS_IGNORED_IN_QUERY_CAPTURES  # type: ignore
+
+    @property
+    def captured_queries(self):
+        # flake8: noqa
+        base_queries = self.connection.queries[
+            self.initial_queries : self.final_queries
+        ]
+        new_queries = []
+
+        def is_query_ignored(sql):
+            for pattern in self.IGNORED_QUERIES:
+                # Ignore the query if matches
+                if pattern.match(sql):
+                    return True
+            return False
+
+        for query in base_queries:
+            if not is_query_ignored(query["sql"]):
+                new_queries.append(query)
+
+        return new_queries
+
+
+def _assert_num_queries(context, *, config, num, exact=True, info=None):
+    """
+    Extracted from pytest_django.fixtures._assert_num_queries
+    """
+    yield context
+
+    verbose = config.getoption("verbose") > 0
+    num_performed = len(context)
+
+    if exact:
+        failed = num != num_performed
+    else:
+        failed = num_performed > num
+
+    if not failed:
+        return
+
+    msg = "Expected to perform {} queries {}{}".format(
+        num,
+        "" if exact else "or less ",
+        "but {} done".format(
+            num_performed == 1 and "1 was" or "%d were" % (num_performed,)
+        ),
+    )
+    if info:
+        msg += "\n{}".format(info)
+    if verbose:
+        sqls = (q["sql"] for q in context.captured_queries)
+        msg += "\n\nQueries:\n========\n\n%s" % "\n\n".join(sqls)
+    else:
+        msg += " (add -v option to show queries)"
+    pytest.fail(msg)
+
+
+@pytest.fixture
+def capture_queries(pytestconfig):
+    cfg = pytestconfig
+
+    @contextmanager
+    def _capture_queries(
+        num: Optional[int] = None, msg: Optional[str] = None, exact=False
+    ):
+        with CaptureQueriesContext(connection) as ctx:
+            yield ctx
+            if num is not None:
+                _assert_num_queries(ctx, config=cfg, num=num, exact=exact, info=msg)
+
+    return _capture_queries
+
+
+@pytest.fixture
+def assert_num_queries(capture_queries):
+    return partial(capture_queries, exact=True)
+
+
+@pytest.fixture
+def assert_max_num_queries(capture_queries):
+    return partial(capture_queries, exact=False)
 
 
 @pytest.fixture(autouse=True)
@@ -96,7 +207,9 @@ def site_settings(db, settings) -> SiteSettings:
 
 @pytest.fixture
 def checkout(db):
-    return Checkout.objects.create()
+    checkout = Checkout.objects.create()
+    checkout.set_country("US", commit=True)
+    return checkout
 
 
 @pytest.fixture
@@ -122,6 +235,7 @@ def checkout_with_items(checkout, product_list, product):
     for prod in product_list:
         variant = prod.variants.get()
         add_variant_to_checkout(checkout, variant, 1)
+    checkout.refresh_from_db()
     return checkout
 
 
@@ -150,6 +264,17 @@ def checkout_with_gift_card(checkout_with_item, gift_card):
     checkout_with_item.gift_cards.add(gift_card)
     checkout_with_item.save()
     return checkout_with_item
+
+
+@pytest.fixture
+def checkout_with_voucher_percentage_and_shipping(
+    checkout_with_voucher_percentage, shipping_method, address
+):
+    checkout = checkout_with_voucher_percentage
+    checkout.shipping_method = shipping_method
+    checkout.shipping_address = address
+    checkout.save()
+    return checkout
 
 
 @pytest.fixture
@@ -221,12 +346,28 @@ def customer_user(address):  # pylint: disable=W0613
         last_name="Wade",
     )
     user.addresses.add(default_address)
+    user._password = "password"
     return user
 
 
 @pytest.fixture
 def user_checkout(customer_user):
-    return Checkout.objects.get_or_create(user=customer_user)[0]
+    checkout = Checkout.objects.create(
+        user=customer_user,
+        billing_address=customer_user.default_billing_address,
+        shipping_address=customer_user.default_shipping_address,
+        note="Test notes",
+    )
+    return checkout
+
+
+@pytest.fixture
+def user_checkout_with_items(user_checkout, product_list):
+    for product in product_list:
+        variant = product.variants.get()
+        add_variant_to_checkout(user_checkout, variant, 1)
+    user_checkout.refresh_from_db()
+    return user_checkout
 
 
 @pytest.fixture
@@ -262,14 +403,6 @@ def admin_user(db):
 
 
 @pytest.fixture
-def admin_client(admin_user):
-    """Return a Django test client logged in as an admin user."""
-    client = Client()
-    client.login(username=admin_user.email, password="password")
-    return client
-
-
-@pytest.fixture
 def staff_user(db):
     """Return a staff member."""
     return User.objects.create_user(
@@ -278,19 +411,6 @@ def staff_user(db):
         is_staff=True,
         is_active=True,
     )
-
-
-@pytest.fixture
-def staff_client(client, staff_user):
-    """Return a Django test client logged in as an staff member."""
-    client.login(username=staff_user.email, password="password")
-    return client
-
-
-@pytest.fixture
-def authorized_client(client, customer_user):
-    client.login(username=customer_user.email, password="password")
-    return client
 
 
 @pytest.fixture
@@ -405,12 +525,30 @@ def categories_tree(db, product_type):  # pylint: disable=W0613
 
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-10",
         price=Money(10, "USD"),
         product_type=product_type,
         category=child,
+        is_published=True,
     )
 
     associate_attribute_values_to_instance(product, product_attr, attr_value)
+    return parent
+
+
+@pytest.fixture
+def categories_tree_with_published_products(categories_tree, product):
+    parent = categories_tree
+    parent_product = product
+    parent_product.category = parent
+
+    child = parent.children.first()
+    child_product = child.products.first()
+
+    for product in [child_product, parent_product]:
+        product.publication_date = datetime.date.today()
+        product.is_published = True
+        product.save()
     return parent
 
 
@@ -435,6 +573,11 @@ def permission_manage_orders():
 
 
 @pytest.fixture
+def permission_manage_checkouts():
+    return Permission.objects.get(codename="manage_checkouts")
+
+
+@pytest.fixture
 def permission_manage_plugins():
     return Permission.objects.get(codename="manage_plugins")
 
@@ -447,7 +590,10 @@ def permission_manage_service_accounts():
 @pytest.fixture
 def product_type(color_attribute, size_attribute):
     product_type = ProductType.objects.create(
-        name="Default Type", has_variants=True, is_shipping_required=True
+        name="Default Type",
+        slug="default-type",
+        has_variants=True,
+        is_shipping_required=True,
     )
     product_type.product_attributes.add(color_attribute)
     product_type.variant_attributes.add(size_attribute)
@@ -457,21 +603,23 @@ def product_type(color_attribute, size_attribute):
 @pytest.fixture
 def product_type_without_variant():
     product_type = ProductType.objects.create(
-        name="Type", has_variants=False, is_shipping_required=True
+        name="Type", slug="type", has_variants=False, is_shipping_required=True
     )
     return product_type
 
 
 @pytest.fixture
-def product(product_type, category):
+def product(product_type, category, warehouse):
     product_attr = product_type.product_attributes.first()
     product_attr_value = product_attr.values.first()
 
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-11",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
 
     associate_attribute_values_to_instance(product, product_attr, product_attr_value)
@@ -480,38 +628,85 @@ def product(product_type, category):
     variant_attr_value = variant_attr.values.first()
 
     variant = ProductVariant.objects.create(
-        product=product,
-        sku="123",
-        cost_price=Money("1.00", "USD"),
-        quantity=10,
-        quantity_allocated=1,
+        product=product, sku="123", cost_price=Money("1.00", "USD")
     )
+    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=10)
 
     associate_attribute_values_to_instance(variant, variant_attr, variant_attr_value)
     return product
 
 
 @pytest.fixture
-def product_with_two_variants(color_attribute, size_attribute, category):
+def product_with_single_variant(product_type, category, warehouse):
+    product = Product.objects.create(
+        name="Test product with single variant",
+        slug="test-product-with-single-variant",
+        price=Money("1.99", "USD"),
+        product_type=product_type,
+        category=category,
+        is_published=True,
+    )
+    variant = ProductVariant.objects.create(
+        product=product, sku="SKU_SINGLE_VARIANT", cost_price=Money("1.00", "USD")
+    )
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=101)
+    return product
+
+
+@pytest.fixture
+def product_with_two_variants(product_type, category, warehouse):
+    product = Product.objects.create(
+        name="Test product with two variants",
+        slug="test-product-with-two-variant",
+        price=Money("10.00", "USD"),
+        product_type=product_type,
+        category=category,
+        is_published=True,
+    )
+
+    variants = [
+        ProductVariant(
+            product=product,
+            sku=f"Product variant #{i}",
+            cost_price=Money("1.00", "USD"),
+        )
+        for i in (1, 2)
+    ]
+    ProductVariant.objects.bulk_create(variants)
+    Stock.objects.bulk_create(
+        [
+            Stock(warehouse=warehouse, product_variant=variant, quantity=10,)
+            for variant in variants
+        ]
+    )
+
+    return product
+
+
+@pytest.fixture
+def product_with_variant_with_two_attributes(
+    color_attribute, size_attribute, category, warehouse
+):
     product_type = ProductType.objects.create(
-        name="Type with two variants", has_variants=True, is_shipping_required=True
+        name="Type with two variants",
+        slug="two-variants",
+        has_variants=True,
+        is_shipping_required=True,
     )
     product_type.variant_attributes.add(color_attribute)
     product_type.variant_attributes.add(size_attribute)
 
     product = Product.objects.create(
         name="Test product with two variants",
+        slug="test-product-with-two-variant",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
 
     variant = ProductVariant.objects.create(
-        product=product,
-        sku="prodVar1",
-        cost_price=Money("1.00", "USD"),
-        quantity=10,
-        quantity_allocated=1,
+        product=product, sku="prodVar1", cost_price=Money("1.00", "USD")
     )
 
     associate_attribute_values_to_instance(
@@ -546,29 +741,36 @@ def product_with_multiple_values_attributes(product, product_type, category) -> 
 
 
 @pytest.fixture
-def product_with_default_variant(product_type_without_variant, category):
+def product_with_default_variant(product_type_without_variant, category, warehouse):
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-3",
         price=Money(10, "USD"),
         product_type=product_type_without_variant,
         category=category,
+        is_published=True,
     )
-    ProductVariant.objects.create(
-        product=product, sku="1234", track_inventory=True, quantity=100
+    variant = ProductVariant.objects.create(
+        product=product, sku="1234", track_inventory=True
     )
+    Stock.objects.create(warehouse=warehouse, product_variant=variant, quantity=100)
     return product
 
 
 @pytest.fixture
-def variant(product):
+def variant(product) -> ProductVariant:
     product_variant = ProductVariant.objects.create(
-        product=product,
-        sku="SKU_A",
-        cost_price=Money(1, "USD"),
-        quantity=5,
-        quantity_allocated=3,
+        product=product, sku="SKU_A", cost_price=Money(1, "USD")
     )
     return product_variant
+
+
+@pytest.fixture
+def variant_with_many_stocks(variant, warehouses_with_shipping_zone):
+    warehouses = warehouses_with_shipping_zone
+    Stock.objects.create(warehouse=warehouses[0], product_variant=variant, quantity=4)
+    Stock.objects.create(warehouse=warehouses[1], product_variant=variant, quantity=3)
+    return variant
 
 
 @pytest.fixture
@@ -585,22 +787,36 @@ def product_variant_list(product):
 
 
 @pytest.fixture
-def product_without_shipping(category):
+def product_without_shipping(category, warehouse):
     product_type = ProductType.objects.create(
-        name="Type with no shipping", has_variants=False, is_shipping_required=False
+        name="Type with no shipping",
+        slug="no-shipping",
+        has_variants=False,
+        is_shipping_required=False,
     )
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-4",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
-    ProductVariant.objects.create(product=product, sku="SKU_B")
+    variant = ProductVariant.objects.create(product=product, sku="SKU_B")
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=1)
     return product
 
 
 @pytest.fixture
-def product_list(product_type, category):
+def product_without_category(product):
+    product.category = None
+    product.is_published = False
+    product.save()
+    return product
+
+
+@pytest.fixture
+def product_list(product_type, category, warehouse):
     product_attr = product_type.product_attributes.first()
     attr_value = product_attr.values.first()
 
@@ -610,6 +826,7 @@ def product_list(product_type, category):
                 Product(
                     pk=1486,
                     name="Test product 1",
+                    slug="test-product-a",
                     price=Money(10, "USD"),
                     category=category,
                     product_type=product_type,
@@ -618,6 +835,7 @@ def product_list(product_type, category):
                 Product(
                     pk=1487,
                     name="Test product 2",
+                    slug="test-product-b",
                     price=Money(20, "USD"),
                     category=category,
                     product_type=product_type,
@@ -626,7 +844,8 @@ def product_list(product_type, category):
                 Product(
                     pk=1489,
                     name="Test product 3",
-                    price=Money(20, "USD"),
+                    slug="test-product-c",
+                    price=Money(30, "USD"),
                     category=category,
                     product_type=product_type,
                     is_published=True,
@@ -634,28 +853,31 @@ def product_list(product_type, category):
             ]
         )
     )
-    ProductVariant.objects.bulk_create(
-        [
-            ProductVariant(
-                product=products[0],
-                sku=str(uuid.uuid4()).replace("-", ""),
-                track_inventory=True,
-                quantity=100,
-            ),
-            ProductVariant(
-                product=products[1],
-                sku=str(uuid.uuid4()).replace("-", ""),
-                track_inventory=True,
-                quantity=100,
-            ),
-            ProductVariant(
-                product=products[2],
-                sku=str(uuid.uuid4()).replace("-", ""),
-                track_inventory=True,
-                quantity=100,
-            ),
-        ]
+    variants = list(
+        ProductVariant.objects.bulk_create(
+            [
+                ProductVariant(
+                    product=products[0],
+                    sku=str(uuid.uuid4()).replace("-", ""),
+                    track_inventory=True,
+                ),
+                ProductVariant(
+                    product=products[1],
+                    sku=str(uuid.uuid4()).replace("-", ""),
+                    track_inventory=True,
+                ),
+                ProductVariant(
+                    product=products[2],
+                    sku=str(uuid.uuid4()).replace("-", ""),
+                    track_inventory=True,
+                ),
+            ]
+        )
     )
+    stocks = []
+    for variant in variants:
+        stocks.append(Stock(warehouse=warehouse, product_variant=variant, quantity=100))
+    Stock.objects.bulk_create(stocks)
 
     for product in products:
         associate_attribute_values_to_instance(product, product_attr, attr_value)
@@ -702,6 +924,7 @@ def product_with_image(product, image, media_root):
 def unavailable_product(product_type, category):
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-5",
         price=Money("10.00", "USD"),
         product_type=product_type,
         is_published=False,
@@ -711,9 +934,10 @@ def unavailable_product(product_type, category):
 
 
 @pytest.fixture
-def unavailable_product_with_variant(product_type, category):
+def unavailable_product_with_variant(product_type, category, warehouse):
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-6",
         price=Money("10.00", "USD"),
         product_type=product_type,
         is_published=False,
@@ -724,12 +948,9 @@ def unavailable_product_with_variant(product_type, category):
     variant_attr_value = variant_attr.values.first()
 
     variant = ProductVariant.objects.create(
-        product=product,
-        sku="123",
-        cost_price=Money(1, "USD"),
-        quantity=10,
-        quantity_allocated=1,
+        product=product, sku="123", cost_price=Money(1, "USD")
     )
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=10)
 
     associate_attribute_values_to_instance(variant, variant_attr, variant_attr_value)
     return product
@@ -739,9 +960,11 @@ def unavailable_product_with_variant(product_type, category):
 def product_with_images(product_type, category, media_root):
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-7",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
     file_mock_0 = MagicMock(spec=File, name="FileMock0")
     file_mock_0.name = "image0.jpg"
@@ -776,7 +999,7 @@ def voucher_specific_product_type(voucher_percentage):
 @pytest.fixture
 def voucher_with_high_min_spent_amount():
     return Voucher.objects.create(
-        code="mirumee", discount_value=10, min_spent=Money(1000000, "USD")
+        code="mirumee", discount_value=10, min_spent=Money(1_000_000, "USD")
     )
 
 
@@ -788,12 +1011,20 @@ def voucher_shipping_type():
 
 
 @pytest.fixture
+def voucher_free_shipping(voucher_percentage):
+    voucher_percentage.type = VoucherType.SHIPPING
+    voucher_percentage.discount_value = 100
+    voucher_percentage.save()
+    return voucher_percentage
+
+
+@pytest.fixture
 def voucher_customer(voucher, customer_user):
     email = customer_user.email
     return VoucherCustomer.objects.create(voucher=voucher, customer_email=email)
 
 
-@pytest.fixture()
+@pytest.fixture
 def order_line(order, variant):
     net = variant.get_price()
     gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
@@ -807,6 +1038,39 @@ def order_line(order, variant):
         unit_price=TaxedMoney(net=net, gross=gross),
         tax_rate=23,
     )
+
+
+@pytest.fixture
+def order_line_with_allocation_in_many_stocks(customer_user, variant_with_many_stocks):
+    address = customer_user.default_billing_address.get_copy()
+    variant = variant_with_many_stocks
+    stocks = variant.stocks.all().order_by("pk")
+
+    order = Order.objects.create(
+        billing_address=address, user_email=customer_user.email, user=customer_user
+    )
+
+    net = variant.get_price()
+    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
+    order_line = order.lines.create(
+        product_name=str(variant.product),
+        variant_name=str(variant),
+        product_sku=variant.sku,
+        is_shipping_required=variant.is_shipping_required(),
+        quantity=2,
+        variant=variant,
+        unit_price=TaxedMoney(net=net, gross=gross),
+        tax_rate=23,
+    )
+
+    Allocation.objects.bulk_create(
+        [
+            Allocation(order_line=order_line, stock=stocks[0], quantity_allocated=2),
+            Allocation(order_line=order_line, stock=stocks[1], quantity_allocated=1),
+        ]
+    )
+
+    return order_line
 
 
 @pytest.fixture
@@ -837,24 +1101,25 @@ def gift_card_created_by_staff(staff_user):
     )
 
 
-@pytest.fixture()
-def order_with_lines(order, product_type, category, shipping_zone):
+@pytest.fixture
+def order_with_lines(order, product_type, category, shipping_zone, warehouse):
     product = Product.objects.create(
         name="Test product",
+        slug="test-product-8",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
     variant = ProductVariant.objects.create(
-        product=product,
-        sku="SKU_A",
-        cost_price=Money(1, "USD"),
-        quantity=5,
-        quantity_allocated=3,
+        product=product, sku="SKU_A", cost_price=Money(1, "USD")
+    )
+    stock = Stock.objects.create(
+        warehouse=warehouse, product_variant=variant, quantity=5
     )
     net = variant.get_price()
     gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.lines.create(
+    line = order.lines.create(
         product_name=str(variant.product),
         variant_name=str(variant),
         product_sku=variant.sku,
@@ -864,24 +1129,28 @@ def order_with_lines(order, product_type, category, shipping_zone):
         unit_price=TaxedMoney(net=net, gross=gross),
         tax_rate=23,
     )
+    Allocation.objects.create(
+        order_line=line, stock=stock, quantity_allocated=line.quantity
+    )
 
     product = Product.objects.create(
         name="Test product 2",
+        slug="test-product-9",
         price=Money("20.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
     variant = ProductVariant.objects.create(
-        product=product,
-        sku="SKU_B",
-        cost_price=Money(2, "USD"),
-        quantity=2,
-        quantity_allocated=2,
+        product=product, sku="SKU_B", cost_price=Money(2, "USD")
+    )
+    stock = Stock.objects.create(
+        product_variant=variant, warehouse=warehouse, quantity=2
     )
 
     net = variant.get_price()
     gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
-    order.lines.create(
+    line = order.lines.create(
         product_name=str(variant.product),
         variant_name=str(variant),
         product_sku=variant.sku,
@@ -890,6 +1159,9 @@ def order_with_lines(order, product_type, category, shipping_zone):
         variant=variant,
         unit_price=TaxedMoney(net=net, gross=gross),
         tax_rate=23,
+    )
+    Allocation.objects.create(
+        order_line=line, stock=stock, quantity_allocated=line.quantity
     )
 
     order.shipping_address = order.billing_address.get_copy()
@@ -948,6 +1220,7 @@ def fulfillment(fulfilled_order):
 
 @pytest.fixture
 def draft_order(order_with_lines):
+    Allocation.objects.filter(order_line__order=order_with_lines).delete()
     order_with_lines.status = OrderStatus.DRAFT
     order_with_lines.save(update_fields=["status"])
     return order_with_lines
@@ -983,6 +1256,24 @@ def payment_txn_captured(order_with_lines, payment_dummy):
         kind=TransactionKind.CAPTURE,
         gateway_response={},
         is_success=True,
+    )
+    return payment
+
+
+@pytest.fixture
+def payment_txn_to_confirm(order_with_lines, payment_dummy):
+    order = order_with_lines
+    payment = payment_dummy
+    payment.order = order
+    payment.to_confirm = True
+    payment.save()
+
+    payment.transactions.create(
+        amount=payment.total,
+        kind=TransactionKind.CAPTURE,
+        gateway_response={},
+        is_success=True,
+        action_required=True,
     )
     return payment
 
@@ -1047,13 +1338,6 @@ def authorization_key(site_settings, authorization_backend_name):
 
 
 @pytest.fixture
-def base_backend(authorization_backend_name):
-    base_backend = BaseBackend()
-    base_backend.DB_NAME = authorization_backend_name
-    return base_backend
-
-
-@pytest.fixture
 def permission_manage_staff():
     return Permission.objects.get(codename="manage_staff")
 
@@ -1079,11 +1363,6 @@ def permission_manage_settings():
 
 
 @pytest.fixture
-def permission_impersonate_users():
-    return Permission.objects.get(codename="impersonate_users")
-
-
-@pytest.fixture
 def permission_manage_menus():
     return Permission.objects.get(codename="manage_menus")
 
@@ -1101,6 +1380,21 @@ def permission_manage_translations():
 @pytest.fixture
 def permission_manage_webhooks():
     return Permission.objects.get(codename="manage_webhooks")
+
+
+@pytest.fixture
+def permission_group_manage_users(permission_manage_users, staff_user):
+    group = Group.objects.create(name="Manage user groups.")
+    group.permissions.add(permission_manage_users)
+
+    staff_user2 = User.objects.get(pk=staff_user.pk)
+    staff_user2.id = None
+    staff_user2.email = "test_staff@example.com"
+    staff_user2.save()
+    staff_user2.refresh_from_db()
+
+    group.user_set.add(staff_user2)
+    return group
 
 
 @pytest.fixture
@@ -1127,6 +1421,7 @@ def collection_with_image(db, image, media_root):
         slug="collection",
         description="Test description",
         background_image=image,
+        is_published=True,
     )
     return collection
 
@@ -1135,9 +1430,9 @@ def collection_with_image(db, image, media_root):
 def collection_list(db):
     collections = Collection.objects.bulk_create(
         [
-            Collection(name="Collection 1"),
-            Collection(name="Collection 2"),
-            Collection(name="Collection 3"),
+            Collection(name="Collection 1", slug="collection-1", is_published="True"),
+            Collection(name="Collection 2", slug="collection-2", is_published="True"),
+            Collection(name="Collection 3", slug="collection-3", is_published="True"),
         ]
     )
     return collections
@@ -1170,15 +1465,30 @@ def unpublished_collection():
 
 @pytest.fixture
 def page(db):
-    data = {"slug": "test-url", "title": "Test page", "content": "test content"}
+    data = {
+        "slug": "test-url",
+        "title": "Test page",
+        "content": "test content",
+        "is_published": True,
+    }
     page = Page.objects.create(**data)
     return page
 
 
 @pytest.fixture
 def page_list(db):
-    data_1 = {"slug": "test-url", "title": "Test page", "content": "test content"}
-    data_2 = {"slug": "test-url-2", "title": "Test page", "content": "test content"}
+    data_1 = {
+        "slug": "test-url",
+        "title": "Test page",
+        "content": "test content",
+        "is_published": True,
+    }
+    data_2 = {
+        "slug": "test-url-2",
+        "title": "Test page",
+        "content": "test content",
+        "is_published": True,
+    }
     pages = Page.objects.bulk_create([Page(**data_1), Page(**data_2)])
     return pages
 
@@ -1247,7 +1557,16 @@ def translated_variant_fr(product):
 def translated_attribute(product):
     attribute = product.product_type.product_attributes.first()
     return AttributeTranslation.objects.create(
-        language_code="fr", attribute=attribute, name="Name tranlsated to french"
+        language_code="fr", attribute=attribute, name="French attribute name"
+    )
+
+
+@pytest.fixture
+def translated_attribute_value(pink_attribute_value):
+    return AttributeValueTranslation.objects.create(
+        language_code="fr",
+        attribute_value=pink_attribute_value,
+        name="French attribute value name",
     )
 
 
@@ -1265,6 +1584,66 @@ def product_translation_fr(product):
         product=product,
         name="French name",
         description="French description",
+    )
+
+
+@pytest.fixture
+def variant_translation_fr(variant):
+    return ProductVariantTranslation.objects.create(
+        language_code="fr", product_variant=variant, name="French product variant name"
+    )
+
+
+@pytest.fixture
+def collection_translation_fr(collection):
+    return CollectionTranslation.objects.create(
+        language_code="fr",
+        collection=collection,
+        name="French collection name",
+        description="French description",
+    )
+
+
+@pytest.fixture
+def category_translation_fr(category):
+    return CategoryTranslation.objects.create(
+        language_code="fr",
+        category=category,
+        name="French category name",
+        description="French category description",
+    )
+
+
+@pytest.fixture
+def page_translation_fr(page):
+    return PageTranslation.objects.create(
+        language_code="fr",
+        page=page,
+        title="French page title",
+        content="French page content",
+    )
+
+
+@pytest.fixture
+def shipping_method_translation_fr(shipping_method):
+    return ShippingMethodTranslation.objects.create(
+        language_code="fr",
+        shipping_method=shipping_method,
+        name="French shipping method name",
+    )
+
+
+@pytest.fixture
+def sale_translation_fr(sale):
+    return SaleTranslation.objects.create(
+        language_code="fr", sale=sale, name="French sale name"
+    )
+
+
+@pytest.fixture
+def menu_item_translation_fr(menu_item):
+    return MenuItemTranslation.objects.create(
+        language_code="fr", menu_item=menu_item, name="French manu item name"
     )
 
 
@@ -1295,25 +1674,27 @@ def payment_dummy(db, order_with_lines):
 
 
 @pytest.fixture
-def digital_content(category, media_root) -> DigitalContent:
+def digital_content(category, media_root, warehouse) -> DigitalContent:
     product_type = ProductType.objects.create(
         name="Digital Type",
+        slug="digital-type",
         has_variants=True,
         is_shipping_required=False,
         is_digital=True,
     )
     product = Product.objects.create(
         name="Test digital product",
+        slug="test-digital-product",
         price=Money("10.00", "USD"),
         product_type=product_type,
         category=category,
+        is_published=True,
     )
     product_variant = ProductVariant.objects.create(
-        product=product,
-        sku="SKU_554",
-        cost_price=Money(1, "USD"),
-        quantity=5,
-        quantity_allocated=3,
+        product=product, sku="SKU_554", cost_price=Money(1, "USD")
+    )
+    Stock.objects.create(
+        product_variant=product_variant, warehouse=warehouse, quantity=5,
     )
 
     assert product_variant.is_digital()
@@ -1418,22 +1799,6 @@ def description_json():
 
 
 @pytest.fixture
-def description_raw():
-    return """\
-E-commerce for the PWA era
-A modular, high performance e-commerce storefront built with GraphQL, Django, \
-and ReactJS.
-
-Saleor is a rapidly-growing open source e-commerce platform that has served \
-high-volume companies from branches like publishing and apparel since 2012. \
-Based on Python and Django, the latest major update introduces a modular \
-front end with a GraphQL API and storefront and dashboard written in React \
-to make Saleor a full-functionality open source e-commerce.
-
-Get Saleor today!"""
-
-
-@pytest.fixture
 def other_description_json():
     return {
         "blocks": [
@@ -1464,15 +1829,6 @@ def other_description_json():
 
 
 @pytest.fixture
-def other_description_raw():
-    return (
-        "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS\n"
-        "Saleor is powered by a GraphQL server running on top of Python 3 "
-        "and a Django 2 framework."
-    )
-
-
-@pytest.fixture
 def service_account(db):
     return ServiceAccount.objects.create(name="Sample service account", is_active=True)
 
@@ -1494,9 +1850,161 @@ def fake_payment_interface(mocker):
 @pytest.fixture
 def mock_get_manager(mocker, fake_payment_interface):
     mgr = mocker.patch(
-        "saleor.payment.gateway.get_extensions_manager",
+        "saleor.payment.gateway.get_plugins_manager",
         autospec=True,
         return_value=fake_payment_interface,
     )
     yield fake_payment_interface
     mgr.assert_called_once()
+
+
+@pytest.fixture
+def staff_notification_recipient(db, staff_user):
+    return StaffNotificationRecipient.objects.create(active=True, user=staff_user)
+
+
+@pytest.fixture
+def customer_wishlist(customer_user):
+    return Wishlist.objects.create(user=customer_user)
+
+
+@pytest.fixture
+def customer_wishlist_item(customer_wishlist, product_with_single_variant):
+    product = product_with_single_variant
+    assert product.variants.count() == 1
+    variant = product.variants.first()
+    item = customer_wishlist.add_variant(variant)
+    return item
+
+
+@pytest.fixture
+def customer_wishlist_item_with_two_variants(
+    customer_wishlist, product_with_two_variants
+):
+    product = product_with_two_variants
+    assert product.variants.count() == 2
+    [variant_1, variant_2] = product.variants.all()
+    item = customer_wishlist.add_variant(variant_1)
+    item.variants.add(variant_2)
+    return item
+
+
+@pytest.fixture
+def warehouse(address, shipping_zone):
+    warehouse = Warehouse.objects.create(
+        address=address,
+        name="Example Warehouse",
+        slug="example-warehouse",
+        email="test@example.com",
+    )
+    warehouse.shipping_zones.add(shipping_zone)
+    warehouse.save()
+    return warehouse
+
+
+@pytest.fixture
+def warehouses(address):
+    return Warehouse.objects.bulk_create(
+        [
+            Warehouse(
+                address=address.get_copy(),
+                name="Warehouse1",
+                slug="warehouse1",
+                email="warehouse1@example.com",
+            ),
+            Warehouse(
+                address=address.get_copy(),
+                name="Warehouse2",
+                slug="warehouse2",
+                email="warehouse2@example.com",
+            ),
+        ]
+    )
+
+
+@pytest.fixture
+def warehouses_with_shipping_zone(warehouses, shipping_zone):
+    warehouses[0].shipping_zones.add(shipping_zone)
+    warehouses[1].shipping_zones.add(shipping_zone)
+    return warehouses
+
+
+@pytest.fixture
+def warehouse_no_shipping_zone(address):
+    warehouse = Warehouse.objects.create(
+        address=address,
+        name="Warehouse withot shipping zone",
+        email="test2@example.com",
+    )
+    return warehouse
+
+
+@pytest.fixture
+def stock(variant, warehouse):
+    return Stock.objects.create(
+        product_variant=variant, warehouse=warehouse, quantity=15
+    )
+
+
+@pytest.fixture
+def allocation(order_line, stock):
+    return Allocation.objects.create(
+        order_line=order_line, stock=stock, quantity_allocated=order_line.quantity
+    )
+
+
+@pytest.fixture
+def allocations(order_list, stock):
+    variant = stock.product_variant
+    net = variant.get_price()
+    gross = Money(amount=net.amount * Decimal(1.23), currency=net.currency)
+    lines = OrderLine.objects.bulk_create(
+        [
+            OrderLine(
+                order=order_list[0],
+                variant=variant,
+                quantity=1,
+                product_name=str(variant.product),
+                variant_name=str(variant),
+                product_sku=variant.sku,
+                is_shipping_required=variant.is_shipping_required(),
+                unit_price=TaxedMoney(net=net, gross=gross),
+                tax_rate=23,
+            ),
+            OrderLine(
+                order=order_list[1],
+                variant=variant,
+                quantity=2,
+                product_name=str(variant.product),
+                variant_name=str(variant),
+                product_sku=variant.sku,
+                is_shipping_required=variant.is_shipping_required(),
+                unit_price=TaxedMoney(net=net, gross=gross),
+                tax_rate=23,
+            ),
+            OrderLine(
+                order=order_list[2],
+                variant=variant,
+                quantity=4,
+                product_name=str(variant.product),
+                variant_name=str(variant),
+                product_sku=variant.sku,
+                is_shipping_required=variant.is_shipping_required(),
+                unit_price=TaxedMoney(net=net, gross=gross),
+                tax_rate=23,
+            ),
+        ]
+    )
+    return Allocation.objects.bulk_create(
+        [
+            Allocation(
+                order_line=lines[0], stock=stock, quantity_allocated=lines[0].quantity
+            ),
+            Allocation(
+                order_line=lines[1], stock=stock, quantity_allocated=lines[1].quantity
+            ),
+            Allocation(
+                order_line=lines[2], stock=stock, quantity_allocated=lines[2].quantity
+            ),
+        ]
+    )

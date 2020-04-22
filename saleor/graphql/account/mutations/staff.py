@@ -6,27 +6,21 @@ from graphql_jwt.decorators import staff_member_required
 from graphql_jwt.exceptions import PermissionDenied
 
 from ....account import events as account_events, models, utils
+from ....account.emails import send_set_password_email_with_url
 from ....account.error_codes import AccountErrorCode
 from ....account.thumbnails import create_user_avatar_thumbnails
-from ....account.utils import get_random_avatar
+from ....account.utils import remove_staff_member
 from ....checkout import AddressType
-from ....core.permissions import get_permissions
+from ....core.permissions import AccountPermissions, get_permissions
 from ....core.utils.url import validate_storefront_url
-from ....dashboard.emails import send_set_password_email_with_url
-from ....dashboard.staff.utils import remove_staff_member
 from ...account.enums import AddressTypeEnum
 from ...account.types import Address, AddressInput, User
 from ...core.enums import PermissionEnum
-from ...core.mutations import (
-    BaseMutation,
-    ClearMetaBaseMutation,
-    ModelDeleteMutation,
-    ModelMutation,
-    UpdateMetaBaseMutation,
-)
+from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ...core.types import Upload
 from ...core.types.common import AccountError
 from ...core.utils import validate_image_file
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
 from ..utils import CustomerDeleteMixin, StaffDeleteMixin, UserDeleteMixin
 from .base import (
     BaseAddressDelete,
@@ -45,13 +39,6 @@ class StaffInput(UserInput):
 
 
 class StaffCreateInput(StaffInput):
-    send_password_email = graphene.Boolean(
-        description=(
-            "DEPRECATED: Will be removed in Saleor 2.10, if mutation has `redirect_url`"
-            " in input then staff get email with link to set a password. "
-            "Send an email with a link to set the password."
-        )
-    )
     redirect_url = graphene.String(
         description=(
             "URL of a view where users should be redirected to "
@@ -65,7 +52,7 @@ class CustomerCreate(BaseCustomerCreate):
         description = "Creates a new customer."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -81,7 +68,7 @@ class CustomerUpdate(CustomerCreate):
         description = "Updates an existing customer."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -124,7 +111,7 @@ class CustomerUpdate(CustomerCreate):
         new_instance = cls.construct_instance(copy(original_instance), cleaned_input)
 
         # Save the new instance data
-        cls.clean_instance(new_instance)
+        cls.clean_instance(info, new_instance)
         cls.save(info, new_instance, cleaned_input)
         cls._save_m2m(info, new_instance, cleaned_input)
 
@@ -144,7 +131,7 @@ class CustomerDelete(CustomerDeleteMixin, UserDelete):
     class Meta:
         description = "Deletes a customer."
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -168,26 +155,13 @@ class StaffCreate(ModelMutation):
         description = "Creates a new staff user."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
     @classmethod
     def clean_input(cls, info, instance, data):
         cleaned_input = super().clean_input(info, instance, data)
-
-        # DEPRECATED: We should remove this condition when dropping
-        # `send_password_email` from mutation input.
-        if cleaned_input.get("send_password_email"):
-            if not cleaned_input.get("redirect_url"):
-                raise ValidationError(
-                    {
-                        "redirect_url": ValidationError(
-                            "Redirect url is required to send a password.",
-                            AccountErrorCode.REQUIRED,
-                        )
-                    }
-                )
 
         if cleaned_input.get("redirect_url"):
             try:
@@ -208,12 +182,7 @@ class StaffCreate(ModelMutation):
 
     @classmethod
     def save(cls, info, user, cleaned_input):
-        create_avatar = not user.avatar
-        if create_avatar:
-            user.avatar = get_random_avatar()
         user.save()
-        if create_avatar:
-            create_user_avatar_thumbnails.delay(user_id=user.pk)
         if cleaned_input.get("redirect_url"):
             send_set_password_email_with_url(
                 redirect_url=cleaned_input.get("redirect_url"), user=user, staff=True
@@ -231,7 +200,7 @@ class StaffUpdate(StaffCreate):
         description = "Updates an existing staff user."
         exclude = ["password"]
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -270,7 +239,7 @@ class StaffDelete(StaffDeleteMixin, UserDelete):
     class Meta:
         description = "Deletes a staff user."
         model = models.User
-        permissions = ("account.manage_staff",)
+        permissions = (AccountPermissions.MANAGE_STAFF,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -310,7 +279,7 @@ class AddressCreate(ModelMutation):
     class Meta:
         description = "Creates user address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -320,7 +289,7 @@ class AddressCreate(ModelMutation):
         user = cls.get_node_or_error(info, user_id, field="user_id", only_type=User)
         response = super().perform_mutation(root, info, **data)
         if not response.errors:
-            address = info.context.extensions.change_user_address(
+            address = info.context.plugins.change_user_address(
                 response.address, None, user
             )
             user.addresses.add(address)
@@ -332,7 +301,7 @@ class AddressUpdate(BaseAddressUpdate):
     class Meta:
         description = "Updates an address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -341,7 +310,7 @@ class AddressDelete(BaseAddressDelete):
     class Meta:
         description = "Deletes an address."
         model = models.Address
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -358,7 +327,7 @@ class AddressSetDefault(BaseMutation):
 
     class Meta:
         description = "Sets a default address for the given user."
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         error_type_class = AccountError
         error_type_field = "account_errors"
 
@@ -443,7 +412,7 @@ class UserAvatarDelete(BaseMutation):
 class UserUpdatePrivateMeta(UpdateMetaBaseMutation):
     class Meta:
         description = "Updates private metadata for user."
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         model = models.User
         public = False
         error_type_class = AccountError
@@ -454,7 +423,7 @@ class UserClearPrivateMeta(ClearMetaBaseMutation):
     class Meta:
         description = "Clear private metadata for user."
         model = models.User
-        permissions = ("account.manage_users",)
+        permissions = (AccountPermissions.MANAGE_USERS,)
         public = False
         error_type_class = AccountError
         error_type_field = "account_errors"

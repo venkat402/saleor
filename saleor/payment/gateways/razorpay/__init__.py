@@ -9,7 +9,6 @@ import razorpay.errors
 from ... import TransactionKind
 from ...interface import GatewayConfig, GatewayResponse, PaymentData
 from . import errors
-from .forms import RazorPaymentForm
 from .utils import get_amount_for_razorpay, get_error_response
 
 # The list of currencies supported by razorpay
@@ -71,18 +70,9 @@ def clean_razorpay_response(response: Dict):
     response["amount"] = Decimal(response["amount"]) / 100
 
 
-def create_form(data, payment_information, connection_params):
-    """Return the associated razorpay payment form."""
-    return RazorPaymentForm(
-        data=data,
-        payment_information=payment_information,
-        connection_params=connection_params,
-    )
-
-
-def get_client(public_key: str, secret_key: str, **_):
+def get_client(public_key: str, private_key: str, **_):
     """Create a Razorpay client from set-up application keys."""
-    razorpay_client = razorpay.Client(auth=(public_key, secret_key))
+    razorpay_client = razorpay.Client(auth=(public_key, private_key))
     return razorpay_client
 
 

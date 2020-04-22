@@ -4,23 +4,17 @@ from unittest.mock import patch
 import pytest
 from razorpay.errors import BadRequestError, ServerError
 
-from saleor.extensions.manager import get_extensions_manager
 from saleor.payment import ChargeStatus, TransactionKind
 from saleor.payment.gateways.razorpay import (
     capture,
     check_payment_supported,
     clean_razorpay_response,
-    create_form,
     errors,
     get_amount_for_razorpay,
     get_client,
     get_client_token,
     logger,
     refund,
-)
-from saleor.payment.gateways.razorpay.forms import (
-    RazorPayCheckoutWidget,
-    RazorPaymentForm,
 )
 from saleor.payment.interface import GatewayConfig
 from saleor.payment.utils import create_payment_information
@@ -33,10 +27,9 @@ def gateway_config():
     return GatewayConfig(
         gateway_name="razorpay",
         auto_capture=False,
-        template_path="template.html",
         connection_params={
             "public_key": "public",
-            "secret_key": "secret",
+            "private_key": "secret",
             "prefill": True,
             "store_name": "Saleor",
             "store_image": "image.png",
@@ -72,50 +65,6 @@ def charged_payment(razorpay_payment):
         is_success=True,
     )
     return razorpay_payment
-
-
-def test_checkout_widget_render_without_prefill(razorpay_payment, gateway_config):
-    gateway_config.connection_params["prefill"] = False
-    payment_info = create_payment_information(razorpay_payment)
-    widget = RazorPayCheckoutWidget(
-        payment_information=payment_info,
-        attrs={"data-custom": "123"},
-        **gateway_config.connection_params,
-    )
-    assert widget.render() == (
-        '<script data-amount="9840" data-buttontext="Pay now with Razorpay" '
-        'data-currency="INR" data-custom="123" '
-        'data-description="Total payment" '
-        'data-image="image.png" data-key="public" data-name="Saleor" '
-        'src="https://checkout.razorpay.com/v1/checkout.js"></script>'
-    )
-
-
-def test_checkout_widget_render_with_prefill(razorpay_payment, gateway_config):
-    payment_info = create_payment_information(razorpay_payment)
-    widget = RazorPayCheckoutWidget(
-        payment_information=payment_info, **gateway_config.connection_params
-    )
-    assert widget.render() == (
-        '<script data-amount="9840" data-buttontext="Pay now with Razorpay" '
-        'data-currency="INR" data-description="Total payment" '
-        'data-image="image.png" data-key="public" data-name="Saleor" '
-        'data-prefill.email="test@example.com" '
-        'data-prefill.name="Doe John" '
-        'src="https://checkout.razorpay.com/v1/checkout.js"></script>'
-    )
-
-
-def test_checkout_form(razorpay_payment, gateway_config):
-    payment_info = create_payment_information(razorpay_payment)
-    form = create_form(
-        data={"razorpay_payment_id": "123"},
-        payment_information=payment_info,
-        connection_params=gateway_config.connection_params,
-    )
-
-    assert isinstance(form, RazorPaymentForm)
-    assert form.is_valid()
 
 
 def test_check_payment_supported(razorpay_payment):
@@ -314,28 +263,3 @@ def test_refund_invalid_data(
 
     # Ensure the HTTP error was logged
     assert mocked_logger.call_count == 1
-
-
-def test_get_plugin_configuration_hides_all_razor_secrets(settings):
-    settings.PLUGINS = ["saleor.payment.gateways.razorpay.plugin.RazorpayGatewayPlugin"]
-    manager = get_extensions_manager()
-    manager.get_plugin_configuration("Razorpay")
-    manager.save_plugin_configuration(
-        "Razorpay",
-        {
-            "configuration": [
-                {"name": "Public API key", "value": "123"},
-                {"name": "Secret API key", "value": "456"},
-            ]
-        },
-    )
-    plugin_configuration = manager.get_plugin_configuration("Razorpay")
-    configuration = plugin_configuration.configuration
-    public_api_key = [
-        field for field in configuration if field["name"] == "Public API key"
-    ][0]
-    secret_api_key = [
-        field for field in configuration if field["name"] == "Secret API key"
-    ][0]
-    assert public_api_key["value"] == "*" * 10
-    assert secret_api_key["value"] == "*" * 10

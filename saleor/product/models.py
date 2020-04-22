@@ -1,21 +1,16 @@
-from decimal import Decimal
-from typing import Iterable, Union
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.postgres.aggregates import StringAgg
 from django.contrib.postgres.fields import JSONField
-from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import Case, Count, F, FilteredRelation, Q, When
 from django.urls import reverse
 from django.utils.encoding import smart_text
-from django.utils.html import strip_tags
 from django.utils.text import slugify
-from django.utils.translation import pgettext_lazy
 from django_measurement.models import MeasurementField
 from django_prices.models import MoneyField
-from django_prices.templatetags import prices
 from draftjs_sanitizer import clean_draft_js
 from measurement.measures import Weight
 from mptt.managers import TreeManager
@@ -25,13 +20,13 @@ from text_unidecode import unidecode
 from versatileimagefield.fields import PPOIField, VersatileImageField
 
 from ..core.db.fields import SanitizedJSONField
-from ..core.exceptions import InsufficientStock
 from ..core.models import (
     ModelWithMetadata,
     PublishableModel,
     PublishedQuerySet,
     SortableModel,
 )
+from ..core.permissions import ProductPermissions
 from ..core.utils import build_absolute_uri
 from ..core.utils.draftjs import json_content_to_raw_text
 from ..core.utils.translations import TranslationProxy
@@ -41,10 +36,17 @@ from ..discount.utils import calculate_discounted_price
 from ..seo.models import SeoModel, SeoModelTranslation
 from . import AttributeInputType
 
+if TYPE_CHECKING:
+    # flake8: noqa
+    from prices import Money
+
+    from ..account.models import User
+    from django.db.models import OrderBy
+
 
 class Category(MPTTModel, ModelWithMetadata, SeoModel):
-    name = models.CharField(max_length=128)
-    slug = models.SlugField(max_length=128)
+    name = models.CharField(max_length=250)
+    slug = models.SlugField(max_length=255, unique=True)
     description = models.TextField(blank=True)
     description_json = JSONField(blank=True, default=dict)
     parent = models.ForeignKey(
@@ -59,13 +61,8 @@ class Category(MPTTModel, ModelWithMetadata, SeoModel):
     tree = TreeManager()
     translated = TranslationProxy()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
-
-    def get_absolute_url(self):
-        return reverse(
-            "product:category", kwargs={"slug": self.slug, "category_id": self.id}
-        )
 
 
 class CategoryTranslation(SeoModelTranslation):
@@ -80,10 +77,10 @@ class CategoryTranslation(SeoModelTranslation):
     class Meta:
         unique_together = (("language_code", "category"),)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         class_ = type(self)
         return "%s(pk=%r, name=%r, category_pk=%r)" % (
             class_.__name__,
@@ -94,7 +91,8 @@ class CategoryTranslation(SeoModelTranslation):
 
 
 class ProductType(ModelWithMetadata):
-    name = models.CharField(max_length=128)
+    name = models.CharField(max_length=250)
+    slug = models.SlugField(max_length=255, unique=True)
     has_variants = models.BooleanField(default=True)
     is_shipping_required = models.BooleanField(default=True)
     is_digital = models.BooleanField(default=False)
@@ -105,10 +103,10 @@ class ProductType(ModelWithMetadata):
     class Meta:
         app_label = "product"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         class_ = type(self)
         return "<%s.%s(pk=%r, name=%r)>" % (
             class_.__module__,
@@ -148,7 +146,7 @@ class ProductsQueryset(PublishedQuerySet):
             objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts
         )
 
-    def collection_sorted(self, user):
+    def collection_sorted(self, user: "User"):
         qs = self.visible_to_user(user).prefetch_related(
             "collections__products__collectionproduct"
         )
@@ -209,33 +207,29 @@ class ProductsQueryset(PublishedQuerySet):
                     ordering=(
                         [
                             f"filtered_attribute__values__{field_name}"
-                            for field_name in AttributeValue._meta.ordering
+                            for field_name in AttributeValue._meta.ordering or []
                         ]
                     ),
                 ),
                 output_field=models.CharField(),
             ),
+            concatenated_values_order=Case(
+                # Make the products having no such attribute be last in the sorting
+                When(concatenated_values=None, then=2),
+                # Put the products having an empty attribute value at the bottom of
+                # the other products.
+                When(concatenated_values="", then=1),
+                # Put the products having an attribute value to be always at the top
+                default=0,
+                output_field=models.IntegerField(),
+            ),
         )
 
-        qs = qs.extra(
-            order_by=[
-                Case(
-                    # Make the products having no such attribute be last in the sorting
-                    When(concatenated_values=None, then=2),
-                    # Put the products having an empty attribute value at the bottom of
-                    # the other products.
-                    When(concatenated_values="", then=1),
-                    # Put the products having an attribute value to be always at the top
-                    default=0,
-                    output_field=models.IntegerField(),
-                ),
-                # Sort each group of products (0, 1, 2, ...) per attribute values
-                "concatenated_values",
-                # Sort each group of products by name,
-                # if they have the same values or not values
-                "name",
-            ]
-        )
+        # Sort by concatenated_values_order then
+        # Sort each group of products (0, 1, 2, ...) per attribute values
+        # Sort each group of products by name,
+        # if they have the same values or not values
+        qs = qs.order_by("concatenated_values_order", "concatenated_values", "name")
 
         # Descending sorting
         if not ascending:
@@ -247,13 +241,18 @@ class Product(SeoModel, ModelWithMetadata, PublishableModel):
     product_type = models.ForeignKey(
         ProductType, related_name="products", on_delete=models.CASCADE
     )
-    name = models.CharField(max_length=128)
+    name = models.CharField(max_length=250)
+    slug = models.SlugField(max_length=255, unique=True)
     description = models.TextField(blank=True)
     description_json = SanitizedJSONField(
         blank=True, default=dict, sanitizer=clean_draft_js
     )
     category = models.ForeignKey(
-        Category, related_name="products", on_delete=models.CASCADE
+        Category,
+        related_name="products",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
     )
 
     currency = models.CharField(
@@ -286,10 +285,7 @@ class Product(SeoModel, ModelWithMetadata, PublishableModel):
         app_label = "product"
         ordering = ("name",)
         permissions = (
-            (
-                "manage_products",
-                pgettext_lazy("Permission description", "Manage products."),
-            ),
+            (ProductPermissions.MANAGE_PRODUCTS.codename, "Manage products."),
         )
 
     def __iter__(self):
@@ -297,7 +293,7 @@ class Product(SeoModel, ModelWithMetadata, PublishableModel):
             setattr(self, "__variants", self.variants.all())
         return iter(getattr(self, "__variants"))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         class_ = type(self)
         return "<%s.%s(pk=%r, name=%r)>" % (
             class_.__module__,
@@ -306,7 +302,7 @@ class Product(SeoModel, ModelWithMetadata, PublishableModel):
             self.name,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
     def save(
@@ -315,34 +311,20 @@ class Product(SeoModel, ModelWithMetadata, PublishableModel):
         # Make sure the "minimal_variant_price_amount" is set
         if self.minimal_variant_price_amount is None:
             self.minimal_variant_price_amount = self.price_amount
+
         return super().save(force_insert, force_update, using, update_fields)
 
     @property
-    def plain_text_description(self):
-        if settings.USE_JSON_CONTENT:
-            return json_content_to_raw_text(self.description_json)
-        return strip_tags(self.description)
-
-    @property
-    def is_available(self):
-        return self.is_visible and self.is_in_stock()
-
-    def get_absolute_url(self):
-        return reverse(
-            "product:details", kwargs={"slug": self.get_slug(), "product_id": self.id}
-        )
-
-    def get_slug(self):
-        return slugify(smart_text(unidecode(self.name)))
-
-    def is_in_stock(self):
-        return any(variant.is_in_stock() for variant in self)
+    def plain_text_description(self) -> str:
+        return json_content_to_raw_text(self.description_json)
 
     def get_first_image(self):
         images = list(self.images.all())
         return images[0] if images else None
 
-    def get_price_range(self, discounts: Iterable[DiscountInfo] = None):
+    def get_price_range(
+        self, discounts: Optional[Iterable[DiscountInfo]] = None
+    ) -> MoneyRange:
         if self.variants.all():
             prices = [variant.get_price(discounts) for variant in self]
             return MoneyRange(min(prices), max(prices))
@@ -364,10 +346,10 @@ class ProductTranslation(SeoModelTranslation):
     class Meta:
         unique_together = (("language_code", "product"),)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         class_ = type(self)
         return "%s(pk=%r, name=%r, product_pk=%r)" % (
             class_.__name__,
@@ -434,12 +416,7 @@ class ProductVariant(ModelWithMetadata):
     )
     images = models.ManyToManyField("ProductImage", through="VariantImage")
     track_inventory = models.BooleanField(default=True)
-    quantity = models.IntegerField(
-        validators=[MinValueValidator(0)], default=Decimal(1)
-    )
-    quantity_allocated = models.IntegerField(
-        validators=[MinValueValidator(0)], default=Decimal(0)
-    )
+
     cost_price_amount = models.DecimalField(
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
@@ -457,61 +434,35 @@ class ProductVariant(ModelWithMetadata):
     class Meta:
         app_label = "product"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name or self.sku
 
     @property
-    def quantity_available(self):
-        return max(self.quantity - self.quantity_allocated, 0)
-
-    @property
-    def is_visible(self):
+    def is_visible(self) -> bool:
         return self.product.is_visible
 
     @property
-    def is_available(self):
-        return self.is_visible and self.is_in_stock()
-
-    def check_quantity(self, quantity):
-        """Check if there is at least the given quantity in stock.
-
-        If stock handling is disabled, it simply run no check.
-        """
-        if self.track_inventory and quantity > self.quantity_available:
-            raise InsufficientStock(self)
-
-    @property
-    def base_price(self):
+    def base_price(self) -> "Money":
         return (
             self.price_override
             if self.price_override is not None
             else self.product.price
         )
 
-    def get_price(self, discounts: Iterable[DiscountInfo] = None):
+    def get_price(self, discounts: Optional[Iterable[DiscountInfo]] = None) -> "Money":
         return calculate_discounted_price(self.product, self.base_price, discounts)
 
     def get_weight(self):
         return self.weight or self.product.weight or self.product.product_type.weight
 
-    def get_absolute_url(self):
-        slug = self.product.get_slug()
-        product_id = self.product.id
-        return reverse(
-            "product:details", kwargs={"slug": slug, "product_id": product_id}
-        )
-
-    def is_shipping_required(self):
+    def is_shipping_required(self) -> bool:
         return self.product.product_type.is_shipping_required
 
-    def is_digital(self):
+    def is_digital(self) -> bool:
         is_digital = self.product.product_type.is_digital
         return not self.is_shipping_required() and is_digital
 
-    def is_in_stock(self):
-        return self.quantity_available > 0
-
-    def display_product(self, translated=False):
+    def display_product(self, translated: bool = False) -> str:
         if translated:
             product = self.product.translated
             variant_display = str(self.translated)
@@ -523,13 +474,9 @@ class ProductVariant(ModelWithMetadata):
         )
         return smart_text(product_display)
 
-    def get_first_image(self):
+    def get_first_image(self) -> "ProductImage":
         images = list(self.images.all())
         return images[0] if images else self.product.get_first_image()
-
-    def get_ajax_label(self, discounts=None):
-        price = self.get_price(discounts)
-        return "%s, %s, %s" % (self.sku, self.display_product(), prices.amount(price))
 
 
 class ProductVariantTranslation(models.Model):
@@ -559,9 +506,7 @@ class ProductVariantTranslation(models.Model):
 
 class DigitalContent(ModelWithMetadata):
     FILE = "file"
-    TYPE_CHOICES = (
-        (FILE, pgettext_lazy("File as a digital product", "digital_product")),
-    )
+    TYPE_CHOICES = ((FILE, "digital_product"),)
     use_default_settings = models.BooleanField(default=True)
     automatic_fulfillment = models.BooleanField(default=False)
     content_type = models.CharField(max_length=128, default=FILE, choices=TYPE_CHOICES)
@@ -598,20 +543,20 @@ class DigitalContentUrl(models.Model):
             self.token = str(uuid4()).replace("-", "")
         super().save(force_insert, force_update, using, update_fields)
 
-    def get_absolute_url(self) -> str:
-        url = reverse("product:digital-product", kwargs={"token": str(self.token)})
+    def get_absolute_url(self) -> Optional[str]:
+        url = reverse("digital-product", kwargs={"token": str(self.token)})
         return build_absolute_uri(url)
 
 
 class BaseAttributeQuerySet(models.QuerySet):
     @staticmethod
-    def user_has_access_to_all(user):
-        return user.is_active and user.has_perm("product.manage_products")
+    def user_has_access_to_all(user: "User") -> bool:
+        return user.is_active and user.has_perm(ProductPermissions.MANAGE_PRODUCTS)
 
     def get_public_attributes(self):
         raise NotImplementedError
 
-    def get_visible_to_user(self, user):
+    def get_visible_to_user(self, user: "User"):
         if self.user_has_access_to_all(user):
             return self.all()
         return self.get_public_attributes()
@@ -677,7 +622,7 @@ class AttributeProduct(SortableModel):
         Product,
         blank=True,
         through=AssignedProductAttribute,
-        through_fields=["assignment", "product"],
+        through_fields=("assignment", "product"),
         related_name="attributesrelated",
     )
 
@@ -702,7 +647,7 @@ class AttributeVariant(SortableModel):
         ProductVariant,
         blank=True,
         through=AssignedVariantAttribute,
-        through_fields=["assignment", "variant"],
+        through_fields=("assignment", "variant"),
         related_name="attributesrelated",
     )
 
@@ -737,7 +682,7 @@ class AttributeQuerySet(BaseAttributeQuerySet):
         id_field = F(f"{m2m_field_name}__id")
         if asc:
             sort_method = sort_order_field.asc(nulls_last=True)
-            id_sort = id_field
+            id_sort: Union["OrderBy", "F"] = id_field
         else:
             sort_method = sort_order_field.desc(nulls_first=True)
             id_sort = id_field.desc()
@@ -752,8 +697,8 @@ class AttributeQuerySet(BaseAttributeQuerySet):
 
 
 class Attribute(ModelWithMetadata):
-    slug = models.SlugField(max_length=50, unique=True)
-    name = models.CharField(max_length=50)
+    slug = models.SlugField(max_length=250, unique=True)
+    name = models.CharField(max_length=255)
 
     input_type = models.CharField(
         max_length=50,
@@ -766,14 +711,14 @@ class Attribute(ModelWithMetadata):
         blank=True,
         related_name="product_attributes",
         through=AttributeProduct,
-        through_fields=["attribute", "product_type"],
+        through_fields=("attribute", "product_type"),
     )
     product_variant_types = models.ManyToManyField(
         ProductType,
         blank=True,
         related_name="variant_attributes",
         through=AttributeVariant,
-        through_fields=["attribute", "product_type"],
+        through_fields=("attribute", "product_type"),
     )
 
     value_required = models.BooleanField(default=False, blank=True)
@@ -792,13 +737,10 @@ class Attribute(ModelWithMetadata):
     class Meta:
         ordering = ("storefront_search_position", "slug")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
-    def get_formfield_name(self):
-        return slugify("attribute-%s-%s" % (self.slug, self.pk), allow_unicode=True)
-
-    def has_values(self):
+    def has_values(self) -> bool:
         return self.values.exists()
 
 
@@ -821,14 +763,14 @@ class AttributeTranslation(models.Model):
             self.attribute_id,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
 class AttributeValue(SortableModel):
-    name = models.CharField(max_length=100)
+    name = models.CharField(max_length=250)
     value = models.CharField(max_length=100, blank=True, default="")
-    slug = models.SlugField(max_length=100)
+    slug = models.SlugField(max_length=255)
     attribute = models.ForeignKey(
         Attribute, related_name="values", on_delete=models.CASCADE
     )
@@ -839,7 +781,7 @@ class AttributeValue(SortableModel):
         ordering = ("sort_order", "id")
         unique_together = ("slug", "attribute")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
     @property
@@ -860,7 +802,7 @@ class AttributeValueTranslation(models.Model):
     class Meta:
         unique_together = (("language_code", "attribute_value"),)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         class_ = type(self)
         return "%s(pk=%r, name=%r, attribute_value_pk=%r)" % (
             class_.__name__,
@@ -869,7 +811,7 @@ class AttributeValueTranslation(models.Model):
             self.attribute_value_id,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
@@ -914,14 +856,14 @@ class CollectionProduct(SortableModel):
 
 
 class Collection(SeoModel, ModelWithMetadata, PublishableModel):
-    name = models.CharField(max_length=128, unique=True)
-    slug = models.SlugField(max_length=128)
+    name = models.CharField(max_length=250, unique=True)
+    slug = models.SlugField(max_length=255, unique=True)
     products = models.ManyToManyField(
         Product,
         blank=True,
         related_name="collections",
         through=CollectionProduct,
-        through_fields=["collection", "product"],
+        through_fields=("collection", "product"),
     )
     background_image = VersatileImageField(
         upload_to="collection-backgrounds", blank=True, null=True
@@ -935,11 +877,8 @@ class Collection(SeoModel, ModelWithMetadata, PublishableModel):
     class Meta:
         ordering = ("slug",)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
-
-    def get_absolute_url(self):
-        return reverse("product:collection", kwargs={"pk": self.id, "slug": self.slug})
 
 
 class CollectionTranslation(SeoModelTranslation):
@@ -963,5 +902,5 @@ class CollectionTranslation(SeoModelTranslation):
             self.collection_id,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name

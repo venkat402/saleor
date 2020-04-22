@@ -3,19 +3,28 @@ from unittest.mock import Mock, patch
 import django_filters
 import graphene
 import pytest
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.utils import timezone
 from graphene import InputField
 from graphql_jwt.shortcuts import get_token
 
+from saleor.account.error_codes import AccountErrorCode
 from saleor.graphql.core.enums import ReportingPeriod
 from saleor.graphql.core.filters import EnumFilter
 from saleor.graphql.core.mutations import BaseMutation
 from saleor.graphql.core.types import FilterInputObjectType
-from saleor.graphql.core.utils import clean_seo_fields, snake_to_camel_case
+from saleor.graphql.core.utils import (
+    clean_seo_fields,
+    snake_to_camel_case,
+    validate_slug_and_generate_if_needed,
+)
 from saleor.graphql.product import types as product_types
-from saleor.graphql.utils import get_database_id, reporting_period_to_date
-from saleor.product.models import Product
+from saleor.graphql.utils import (
+    filter_range_field,
+    get_database_id,
+    reporting_period_to_date,
+)
+from saleor.product.models import Category, Product
 from tests.api.utils import _get_graphql_content_from_response, get_graphql_content
 
 
@@ -154,7 +163,9 @@ def test_total_count_query(api_client, product):
     assert content["data"]["products"]["totalCount"] == Product.objects.count()
 
 
-def test_mutation_decimal_input(staff_api_client, variant, permission_manage_products):
+def test_mutation_decimal_input(
+    staff_api_client, variant, stock, permission_manage_products
+):
     query = """
     mutation decimalInput($id: ID!, $cost: Decimal) {
         productVariantUpdate(id: $id,
@@ -174,6 +185,7 @@ def test_mutation_decimal_input(staff_api_client, variant, permission_manage_pro
     variables = {
         "id": graphene.Node.to_global_id("ProductVariant", variant.id),
         "cost": 12.12,
+        "quantity": 17,
     }
     response = staff_api_client.post_graphql(
         query, variables, permissions=[permission_manage_products]
@@ -277,6 +289,57 @@ def test_mutation_invalid_permission_in_meta(_mocked, should_fail, permissions_v
     assert exc.value.args[0] == "Permissions should be a tuple or a string in Meta"
 
 
+MUTATION_CREATE_TOKEN = """
+    mutation tokenCreate($email: String!, $password: String!){
+        tokenCreate(email: $email, password: $password) {
+            token
+            user {
+                email
+            }
+            errors {
+                field
+                message
+            }
+            accountErrors {
+                field
+                message
+                code
+            }
+        }
+    }
+"""
+
+
+def test_create_token(api_client, customer_user):
+    variables = {"email": customer_user.email, "password": customer_user._password}
+    response = api_client.post_graphql(MUTATION_CREATE_TOKEN, variables)
+    content = get_graphql_content(response)
+    user_email = content["data"]["tokenCreate"]["user"]["email"]
+    assert customer_user.email == user_email
+    assert content["data"]["tokenCreate"]["token"]
+    assert content["data"]["tokenCreate"]["accountErrors"] == []
+
+
+def test_create_token_invalid_password(api_client, customer_user):
+    variables = {"email": customer_user.email, "password": "wrongpassword"}
+    expected_error_code = AccountErrorCode.INVALID_CREDENTIALS.value.upper()
+    response = api_client.post_graphql(MUTATION_CREATE_TOKEN, variables)
+    content = get_graphql_content(response)
+    response_error = content["data"]["tokenCreate"]["accountErrors"][0]
+    assert response_error["code"] == expected_error_code
+    assert response_error["field"] == "email"
+
+
+def test_create_token_invalid_email(api_client, customer_user):
+    variables = {"email": "wrongemail", "password": "wrongpassword"}
+    expected_error_code = AccountErrorCode.INVALID_CREDENTIALS.value.upper()
+    response = api_client.post_graphql(MUTATION_CREATE_TOKEN, variables)
+    content = get_graphql_content(response)
+    response_error = content["data"]["tokenCreate"]["accountErrors"][0]
+    assert response_error["code"] == expected_error_code
+    assert response_error["field"] == "email"
+
+
 MUTATION_TOKEN_VERIFY = """
     mutation tokenVerify($token: String!){
         tokenVerify(token: $token){
@@ -301,3 +364,62 @@ def test_verify_token_incorrect_token(api_client):
     response = api_client.post_graphql(MUTATION_TOKEN_VERIFY, variables)
     content = get_graphql_content(response)
     assert not content["data"]["tokenVerify"]
+
+
+@pytest.mark.parametrize(
+    "cleaned_input",
+    [
+        {"slug": None, "name": "test"},
+        {"slug": "", "name": "test"},
+        {"slug": ""},
+        {"slug": None},
+    ],
+)
+def test_validate_slug_and_generate_if_needed_raises_errors(category, cleaned_input):
+    with pytest.raises(ValidationError):
+        validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "cleaned_input", [{"slug": "test-slug"}, {"slug": "test-slug", "name": "test"}]
+)
+def test_validate_slug_and_generate_if_needed_not_raises_errors(
+    category, cleaned_input
+):
+    validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "cleaned_input",
+    [
+        {"slug": None, "name": "test"},
+        {"slug": "", "name": "test"},
+        {"slug": ""},
+        {"slug": None},
+        {"slug": "test-slug"},
+        {"slug": "test-slug", "name": "test"},
+    ],
+)
+def test_validate_slug_and_generate_if_needed_generate_slug(cleaned_input):
+    category = Category(name="test")
+    validate_slug_and_generate_if_needed(category, "name", cleaned_input)
+
+
+@pytest.mark.parametrize(
+    "value, count, product_indexes",
+    [
+        ({"lte": 50, "gte": 25}, 1, [2]),
+        ({"lte": 25}, 2, [0, 1]),
+        ({"lte": 10}, 1, [0]),
+        ({"gte": 40}, 0, []),
+    ],
+)
+def test_filter_range_field(value, count, product_indexes, product_list):
+    qs = Product.objects.all().order_by("pk")
+    field = "price_amount"
+
+    result = filter_range_field(qs, field, value)
+
+    expected_products = [qs[index] for index in product_indexes]
+    assert result.count() == count
+    assert list(result) == expected_products

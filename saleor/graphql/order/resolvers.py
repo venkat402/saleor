@@ -5,8 +5,9 @@ from ...order import OrderStatus, models
 from ...order.events import OrderEvents
 from ...order.models import OrderEvent
 from ...order.utils import sum_order_totals
-from ..utils import filter_by_period, filter_by_query_param
+from ..utils import filter_by_period, filter_by_query_param, sort_queryset
 from .enums import OrderStatusFilter
+from .sorters import OrderSortField
 from .types import Order
 
 ORDER_SEARCH_FIELDS = ("id", "discount_name", "token", "user_email", "user__email")
@@ -15,6 +16,7 @@ ORDER_SEARCH_FIELDS = ("id", "discount_name", "token", "user_email", "user__emai
 def filter_orders(qs, info, created, status, query):
     qs = filter_by_query_param(qs, query, ORDER_SEARCH_FIELDS)
 
+    # DEPRECATED: Will be removed in Saleor 2.11, use the `filter` field instead.
     # filter orders by status
     if status is not None:
         if status == OrderStatusFilter.READY_TO_FULFILL:
@@ -22,6 +24,7 @@ def filter_orders(qs, info, created, status, query):
         elif status == OrderStatusFilter.READY_TO_CAPTURE:
             qs = qs.ready_to_capture()
 
+    # DEPRECATED: Will be removed in Saleor 2.11, use the `filter` field instead.
     # filter orders by creation date
     if created is not None:
         qs = filter_by_period(qs, created, "created")
@@ -29,13 +32,15 @@ def filter_orders(qs, info, created, status, query):
     return gql_optimizer.query(qs, info)
 
 
-def resolve_orders(info, created, status, query):
+def resolve_orders(info, created, status, query, sort_by=None):
     qs = models.Order.objects.confirmed()
+    qs = sort_queryset(qs, sort_by, OrderSortField)
     return filter_orders(qs, info, created, status, query)
 
 
-def resolve_draft_orders(info, created, query):
+def resolve_draft_orders(info, created, query, sort_by=None):
     qs = models.Order.objects.drafts()
+    qs = sort_queryset(qs, sort_by, OrderSortField)
     return filter_orders(qs, info, created, None, query)
 
 
@@ -46,12 +51,7 @@ def resolve_orders_total(_info, period):
 
 
 def resolve_order(info, order_id):
-    """Return order only for user assigned to it or proper staff user."""
-    user = info.context.user
-    order = graphene.Node.get_node_from_global_id(info, order_id, Order)
-    if user.has_perm("order.manage_orders") or order.user == user:
-        return order
-    return None
+    return graphene.Node.get_node_from_global_id(info, order_id, Order)
 
 
 def resolve_homepage_events():
@@ -65,4 +65,8 @@ def resolve_homepage_events():
 
 
 def resolve_order_by_token(token):
-    return models.Order.objects.filter(token=token).first()
+    return (
+        models.Order.objects.exclude(status=OrderStatus.DRAFT)
+        .filter(token=token)
+        .first()
+    )
